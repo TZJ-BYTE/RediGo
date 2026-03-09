@@ -1,0 +1,61 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/
+*.log
+
+# Data directory
+data/
+
+# Temporary files
+tmp/
+temp/
+
+# Build output
+build/
+dist/
+
+# Compiled binaries (Gedis specific)
+bin/
+gedis-server
+gedis-client
+
+# Environment variables
+.env
+.env.local
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Coverage reports
+coverage.txt
+coverage.html
+
+# Debugging
+.debug
+*.dbg
