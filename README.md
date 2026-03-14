@@ -405,10 +405,10 @@ netstat -an | grep 16379
 
 ### v1.1 (计划中)
 
-- [ ] 事务支持 (MULTI/EXEC)
-- [ ] Pipeline 优化
-- [ ] Lua 脚本支持
-- [ ] RDB 快照
+- [ ] Write Stall (写入流控)
+- [ ] Universal Compaction (Tiered)
+- [ ] Key-Value 分离 (WiscKey)
+- [ ] 动态 Level 调整
 
 ### v2.0 (未来)
 

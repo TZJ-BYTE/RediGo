@@ -395,6 +395,23 @@ grep -E "(Recover|LoadAllKeys)" logs/server.log
 
 ***
 
+### 潜在优化方向
+
+1. **Write Stall (写入流控)**
+   - **问题**: 写入过快导致 Level 0 堆积，读性能下降
+   - **改进**: 达到阈值（如 12 个文件）时主动降速，平衡读写
+2. **Universal Compaction (Tiered)**
+   - **问题**: Leveled 写放大较高
+   - **改进**: 引入 RocksDB 风格策略，适合写多读少场景
+3. **Key-Value 分离 (WiscKey)**
+   - **问题**: 大 Value 搬运成本高
+   - **改进**: 仅 LSM 存 Key，Value 存 Log，大幅降低写放大
+4. **动态 Level 调整**
+   - **问题**: 固定层级不适应动态负载
+   - **改进**: 自适应调整每层大小阈值
+
+***
+
 ## 📄 许可证
 
 MIT License
