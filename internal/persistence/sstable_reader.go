@@ -339,10 +339,11 @@ func (r *SSTableReader) putBlockToCache(offset uint64, block *Block, size int) {
 
 // SSTableIterator SSTable 迭代器
 type SSTableIterator struct {
-	reader  *SSTableReader
-	current *BlockIterator
-	valid   bool
-	err     error
+	reader    *SSTableReader
+	indexIter *BlockIterator
+	current   *BlockIterator
+	valid     bool
+	err       error
 }
 
 // SeekToFirst 定位到第一个元素
@@ -357,38 +358,17 @@ func (it *SSTableIterator) First() bool {
 		return false
 	}
 	
-	// 在 Index Block 中找到第一个 Data Block
-	indexIter := NewBlockIterator(it.reader.indexBlock.Data())
-	indexIter.SeekToFirst()
+	// 初始化 Index Iterator
+	it.indexIter = NewBlockIterator(it.reader.indexBlock.Data())
+	it.indexIter.SeekToFirst()
 	
-	if !indexIter.Valid() {
+	if !it.indexIter.Valid() {
 		it.valid = false
 		return false
 	}
 	
-	// 解码第一个 BlockHandle
-	handleData := indexIter.Value()
-	var handle BlockHandle
-	_, err := handle.Decode(handleData)
-	if err != nil {
-		it.err = err
-		it.valid = false
-		return false
-	}
-	
-	// 读取第一个 Data Block
-	data := make([]byte, handle.size)
-	_, err = it.reader.file.ReadAt(data, int64(handle.offset))
-	if err != nil {
-		it.err = err
-		it.valid = false
-		return false
-	}
-	
-	it.current = NewBlockIterator(data)
-	it.current.SeekToFirst()
-	it.valid = it.current.Valid()
-	return it.valid
+	// 加载第一个 Block
+	return it.loadBlockFromIndexAndAdvance()
 }
 
 // Seek 定位到第一个 >= key 的元素
@@ -398,25 +378,120 @@ func (it *SSTableIterator) Seek(key []byte) bool {
 		return false
 	}
 	
-	// 在 Index Block 中找到目标 Data Block
-	blockHandle, found := it.reader.findDataBlock(key)
+	it.indexIter = NewBlockIterator(it.reader.indexBlock.Data())
+	
+	var targetHandle BlockHandle
+	found := false
+	
+	// 在 Index Block 中查找目标 Data Block
+	// 我们需要找到最后一个 key <= targetKey 的 block (或者说找到第一个 key > targetKey 的 block 的前一个)
+	// 但由于 Index 中存储的是 Block 的 firstKey，如果 searchKey < firstKey，则该 block 不包含 searchKey
+	// 因此我们找的是最后一个 firstKey <= searchKey 的 block
+	
+	for it.indexIter.SeekToFirst(); it.indexIter.Valid(); it.indexIter.Next() {
+		indexKey := it.indexIter.Key()
+		
+		// 如果 index key > key，说明前一个 block 是目标
+		// 此时 indexIter 指向的是 *下一个* block，正好符合我们在 Next() 中的预期
+		if bytes.Compare(indexKey, key) > 0 {
+			break
+		}
+		
+		// 解码 BlockHandle
+		handleData := it.indexIter.Value()
+		if len(handleData) == 0 {
+			continue
+		}
+		
+		var handle BlockHandle
+		_, err := handle.Decode(handleData)
+		if err != nil {
+			continue
+		}
+		
+		targetHandle = handle
+		found = true
+	}
+	
 	if !found {
 		it.valid = false
 		return false
 	}
 	
-	// 读取 Data Block
-	data := make([]byte, blockHandle.size)
-	_, err := it.reader.file.ReadAt(data, int64(blockHandle.offset))
+	// 加载 Data Block
+	if err := it.loadBlock(targetHandle); err != nil {
+		it.err = err
+		it.valid = false
+		return false
+	}
+	
+	// 在 Data Block 中 Seek
+	it.valid = it.current.Seek(key)
+	
+	// 如果在当前 Block 中没找到 (到达末尾)，但 Block Iterator 是有效的
+	// 这可能意味着 key 大于该 Block 的所有 key
+	// 在这种情况下，我们应该尝试加载下一个 Block
+	if !it.valid && it.current.Error() == nil {
+		// 尝试加载下一个 Block
+		if it.loadNextBlock() {
+			// 在下一个 Block 中 SeekToFirst (因为 key 肯定小于下一个 Block 的所有 key，如果它存在的话)
+			// 等等，如果 key > block1.last, 且 key < block2.first
+			// 那么 key 不存在。
+			// 但是 Seek 的语义是 >= key。
+			// 所以如果是这种情况，我们应该返回 block2.first。
+			// loadNextBlock 会加载 block2 并 SeekToFirst。
+			it.valid = it.current.Valid()
+		}
+	}
+	
+	return it.valid
+}
+
+// loadBlockFromIndexAndAdvance 从当前 indexIter 加载 Block，并将 indexIter 前进一步
+func (it *SSTableIterator) loadBlockFromIndexAndAdvance() bool {
+	if !it.indexIter.Valid() {
+		return false
+	}
+	
+	handleData := it.indexIter.Value()
+	var handle BlockHandle
+	_, err := handle.Decode(handleData)
 	if err != nil {
 		it.err = err
 		it.valid = false
 		return false
 	}
 	
-	it.current = NewBlockIterator(data)
-	it.valid = it.current.Seek(key)
+	// 移动到下一个 index
+	it.indexIter.Next()
+	
+	if err := it.loadBlock(handle); err != nil {
+		it.err = err
+		it.valid = false
+		return false
+	}
+	
+	it.current.SeekToFirst()
+	it.valid = it.current.Valid()
 	return it.valid
+}
+
+// loadBlock 加载指定 handle 的 Block
+func (it *SSTableIterator) loadBlock(handle BlockHandle) error {
+	// 使用 Reader 的缓存机制获取 Block
+	block, cached := it.reader.getBlockFromCache(handle.offset)
+	if !cached {
+		data := make([]byte, handle.size)
+		_, err := it.reader.file.ReadAt(data, int64(handle.offset))
+		if err != nil {
+			return err
+		}
+		block = NewBlock(data)
+		it.reader.putBlockToCache(handle.offset, block, len(data))
+	}
+	
+	it.current = NewBlockIterator(block.Data())
+	return nil
 }
 
 // Key 获取当前 key
@@ -450,20 +525,21 @@ func (it *SSTableIterator) Next() bool {
 	
 	// 如果当前 Block 遍历完了，加载下一个 Block
 	if !it.current.Valid() {
-		// 需要在 Index Block 中移动到下一个 Block
-		// 简化实现：直接设置为无效
-		it.valid = false
-		return false
+		return it.loadNextBlock()
 	}
 	
 	return it.valid
 }
 
 // loadNextBlock 加载下一个 Data Block
-func (it *SSTableIterator) loadNextBlock() {
-	// TODO: 实现加载下一个 Block 的逻辑
-	// 需要知道当前是哪个 Block，然后加载下一个
-	it.valid = false
+func (it *SSTableIterator) loadNextBlock() bool {
+	// 检查是否有下一个 Block
+	if it.indexIter == nil || !it.indexIter.Valid() {
+		it.valid = false
+		return false
+	}
+	
+	return it.loadBlockFromIndexAndAdvance()
 }
 
 // Prev 移动到前一个元素（不支持）

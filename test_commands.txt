@@ -1,0 +1,3 @@
+set test_key persist_value
+get test_key
+exit

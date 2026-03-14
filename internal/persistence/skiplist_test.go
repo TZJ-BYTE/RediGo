@@ -71,14 +71,19 @@ func TestSkipList_Delete(t *testing.T) {
 
 	// 验证其他 key 还在
 	for i := 0; i < 5; i++ {
+		key := []byte(fmt.Sprintf("key%d", i))
 		if i == 2 {
 			continue
 		}
-		key := []byte(fmt.Sprintf("key%d", i))
 		_, exists := sl.Get(key)
 		if !exists {
 			t.Fatalf("Expected key%d to exist", i)
 		}
+	}
+
+	// 验证长度
+	if sl.Length() != 4 {
+		t.Fatalf("Expected length 4, got %d", sl.Length())
 	}
 }
 

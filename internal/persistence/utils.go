@@ -6,6 +6,17 @@ import (
 	"os"
 )
 
+// ========== Tombstone ==========
+
+// Tombstone 删除标记
+var Tombstone = []byte{0x00}
+
+// IsDeleted 检查是否为删除标记
+func IsDeleted(value []byte) bool {
+	// 只要以 0x00 开头，就认为是删除（兼容现有逻辑）
+	return len(value) > 0 && value[0] == 0x00
+}
+
 // ========== 字节序转换 ==========
 
 // PutUint64 将 uint64 编码为字节切片（小端序）

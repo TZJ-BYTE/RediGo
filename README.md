@@ -1,8 +1,8 @@
 # RediGo - 高性能 Redis 兼容服务器
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)]()
-[![Redis Protocol](https://img.shields.io/badge/protocol-redis%207.0-blue)]()
-[![LSM Tree](https://img.shields.io/badge/storage-lsm%20tree-green)]()
+[!\[Build Status\](https://img.shields.io/badge/build-passing-brightgreen null)]()
+[!\[Redis Protocol\](https://img.shields.io/badge/protocol-redis%207.0-blue null)]()
+[!\[LSM Tree\](https://img.shields.io/badge/storage-lsm%20tree-green null)]()
 
 ## 📖 项目简介
 
@@ -15,11 +15,11 @@ RediGo 是一个使用 Go 语言实现的高性能、Redis 协议兼容的键值
 - ✅ **高性能存储** - LevelDB/RocksDB 风格的 LSM Tree 引擎
 - ✅ **并发安全** - 完整的读写锁机制
 - ✅ **数据过期** - 支持 TTL/PTTL 精确过期控制
-- ✅ **多数据库** - 16 个独立数据库（db_0 ~ db_15）
+- ✅ **多数据库** - 16 个独立数据库（db\_0 \~ db\_15）
 - ✅ **批量操作** - MSET/MGET 原子批量操作
 - ✅ **原子增减** - INCR/DECR 原子计数器
 
----
+***
 
 ## 🚀 快速开始
 
@@ -60,7 +60,7 @@ GET mykey
 # Output: "Hello RediGo"
 ```
 
----
+***
 
 ## 📦 项目结构
 
@@ -123,7 +123,7 @@ RediGo/
     └── server.log
 ```
 
----
+***
 
 ## 🔧 配置说明
 
@@ -149,6 +149,7 @@ persistence:
   sstable_size: 10MB         # SSTable 大小
   bloom_filter_bits: 10      # Bloom Filter 位数
   block_cache_size: 100MB    # Block Cache 大小
+  max_open_files: 500        # 最大打开文件数
   
   # 冷启动策略
   cold_start_strategy: "lazy_load"  # no_load | load_all | lazy_load
@@ -156,20 +157,22 @@ persistence:
 
 ### 冷启动策略说明
 
-| 策略 | 配置值 | 说明 | 适用场景 |
-|------|--------|------|----------|
-| **NoLoad** | `no_load` | 不加载历史数据（默认） | 快速启动，作为新实例 |
-| **LoadAll** | `load_all` | 启动时全量加载到内存 | 小数据量，要求快速读取 |
-| **LazyLoad** | `lazy_load` | 懒加载，读取时 fallback | 大数据量，节省内存 |
+| 策略           | 配置值         | 说明               | 适用场景        |
+| ------------ | ----------- | ---------------- | ----------- |
+| **NoLoad**   | `no_load`   | 不加载历史数据（默认）      | 快速启动，作为新实例  |
+| **LoadAll**  | `load_all`  | 启动时全量加载到内存       | 小数据量，要求快速读取 |
+| **LazyLoad** | `lazy_load` | 懒加载，读取时 fallback | 大数据量，节省内存   |
 
----
+***
 
 ## 📋 支持的 Redis 命令
 
 ### 连接测试
+
 - `PING [message]` - 测试服务器连接
 
 ### 字符串操作
+
 - `SET key value` - 设置键值
 - `GET key` - 获取键值
 - `DEL key [key ...]` - 删除键
@@ -188,6 +191,7 @@ persistence:
 - `FLUSHDB` - 清空数据库
 
 ### 列表操作
+
 - `LPUSH key value [value ...]` - 左侧压入
 - `RPUSH key value [value ...]` - 右侧压入
 - `LPOP key` - 左侧弹出
@@ -196,6 +200,7 @@ persistence:
 - `LRANGE key start stop` - 范围查询
 
 ### 哈希操作
+
 - `HSET key field value` - 设置字段
 - `HGET key field` - 获取字段
 - `HMSET key field value [field value ...]` - 批量设置字段
@@ -210,91 +215,72 @@ persistence:
 - `HINCRBYFLOAT key field increment` - 字段浮点递增
 
 ### 数据库管理
+
 - `SELECT index` - 切换数据库
 - `FLUSHDB` - 清空当前库
 - `DBSIZE` - 查询大小
 
-**命令完成率**: ~85% （核心命令全覆盖）
+**命令完成率**: \~85% （核心命令全覆盖）
 
----
+***
 
 ## 🏗️ 架构设计
 
 ### 整体架构
 
-```
-┌─────────────────────────────────────────┐
-│           Redis Client                  │
-└───────────────┬─────────────────────────┘
-                │ RESP Protocol
-┌───────────────▼─────────────────────────┐
-│           TCP Server                    │
-│         (Connection Pool)               │
-└───────────────┬─────────────────────────┘
-                │
-┌───────────────▼─────────────────────────┐
-│        Command Dispatcher               │
-│     (PING, SET, GET, INCR...)          │
-└───────────────┬─────────────────────────┘
-                │
-┌───────────────▼─────────────────────────┐
-│         Database Manager                │
-│      (16 Databases, Isolation)          │
-└───────────────┬─────────────────────────┘
-                │
-        ┌───────┴───────┐
-        │               │
-┌───────▼───────┐ ┌────▼────────┐
-│ Memory Mode   │ │  LSM Mode   │
-│ (In-Memory)   │ │ (Persistent)│
-└───────────────┘ └────┬────────┘
-                       │
-            ┌──────────▼──────────┐
-            │    LSM Engine       │
-            │  ┌───────────────┐  │
-            │  │  MemTable     │  │
-            │  │  (Skip List)  │  │
-            │  └───────┬───────┘  │
-            │          │ Flush    │
-            │  ┌───────▼───────┐  │
-            │  │ Immutable MT  │  │
-            │  └───────┬───────┘  │
-            │          │ Write    │
-            │  ┌───────▼───────┐  │
-            │  │   SSTable     │  │
-            │  │  (Level 0+)   │  │
-            │  └───────────────┘  │
-            │                     │
-            │  + Bloom Filter     │
-            │  + Block Cache      │
-            │  + WAL Log          │
-            │  + Compaction       │
-            └─────────────────────┘
+```mermaid
+graph TD
+    Client[Redis Client] -->|RESP Protocol| TCPServer[TCP Server<br/>Connection Pool]
+    TCPServer --> Dispatcher[Command Dispatcher<br/>PING, SET, GET, INCR...]    
+    Dispatcher --> DBManager[Database Manager<br/>16 Databases, Isolation]      
+
+    DBManager -->|Select Mode| Storage{Storage Mode}
+
+    Storage -->|In-Memory| MemMode[Memory Mode<br/>Go Map + RWMutex]
+    Storage -->|Persistent| LSMMode[LSM Mode<br/>LSMEnergy Engine]
+
+    subgraph LSMEngine [LSM Engine Internals]
+        LSMMode --> MemTable[MemTable<br/>Skip List]
+        MemTable -->|Flush| ImmutaMem[Immutable MemTable]
+        ImmutaMem -->|Write| SSTable[SSTable Files<br/>Level 0-6]
+
+        SSTable -.-> Components[Components]
+        Components --- Bloom[Bloom Filter]
+        Components --- Cache[Block Cache]
+        Components --- WAL[WAL Log]
+        Components --- Compact[Compaction]
+    end
+
+    style Client fill:#f9f,stroke:#333,stroke-width:2px
+    style TCPServer fill:#bbf,stroke:#333,stroke-width:2px
+    style Dispatcher fill:#bfb,stroke:#333,stroke-width:2px
+    style DBManager fill:#fbf,stroke:#333,stroke-width:2px
+    style LSMMode fill:#ff9,stroke:#333,stroke-width:2px
 ```
 
 ### LSM Tree 架构
 
 详见：[`internal/persistence/README.md`](internal/persistence/README.md)
 
----
+***
 
 ## 📊 性能指标
 
 ### 写入性能（LSM Mode）
 
-| 指标 | 目标值 | 实测值 |
-|------|--------|--------|
-| 吞吐量 | > 200K ops/s | ~150K ops/s |
-| WAL 延迟 | < 1ms | < 0.5ms |
-| 压缩率 | > 50% | ~60% |
+| 指标     | 目标值          | 实测值          |
+| ------ | ------------ | ------------ |
+| 吞吐量    | > 200K ops/s | \~150K ops/s |
+| WAL 延迟 | < 1ms        | < 0.5ms      |
+| 压缩率    | > 50%        | \~60%        |
 
 ### 读取性能
 
-| 场景 | 目标延迟 | 实测延迟 |
-|------|---------|---------|
-| 缓存命中 | < 0.5ms | < 0.3ms |
-| 缓存未命中 | < 10ms | < 5ms |
-| Bloom Filter 过滤 | O(1) | O(1) |
+| 场景              | 目标延迟    | 实测延迟    |
+| --------------- | ------- | ------- |
+| 缓存命中            | < 0.5ms | < 0.3ms |
+| 缓存未命中           | < 10ms  | < 5ms   |
+| Bloom Filter 过滤 | O(1)    | O(1)    |
 
 ### 内存效率
 
@@ -302,7 +288,7 @@ persistence:
 - Block Cache：100MB（可配置）
 - Bloom Filter：10 bits/key（可配置）
 
----
+***
 
 ## 🧪 测试
 
@@ -326,7 +312,7 @@ go test ./internal/command -v
 go test ./internal/persistence -bench=. -benchmem
 ```
 
----
+***
 
 ## 🛠️ 开发指南
 
@@ -343,7 +329,7 @@ func (c *MyCommand) Execute(db *database.Database, args []string) *protocol.Resp
 }
 ```
 
-2. 在 [`internal/command/registry.go`](internal/command/registry.go) 中注册：
+1. 在 [`internal/command/registry.go`](internal/command/registry.go) 中注册：
 
 ```go
 DefaultRegistry.Register("MYCMD", &MyCommand{})
@@ -366,14 +352,14 @@ ps aux | grep gedis-server
 netstat -an | grep 16379
 ```
 
----
+***
 
 ## 📚 学习资源
 
 ### 核心文档
 
 - **主文档**: [`README.md`](README.md)（本文件）
-- **持久化模块**: [`internal/persistence/README.md`](internal/persistence/README.md)
+- **持久化模块**: [`internal/persistence/README.md`](internal/persistence/README.md) - 包含 LSM Tree 的详细设计、配置、故障排查和最佳实践。
 
 ### 外部参考
 
@@ -381,7 +367,7 @@ netstat -an | grep 16379
 - [LevelDB Paper](https://leveldb.appspot.com/)
 - [The Log-Structured Merge-Tree](https://www.cs.umb.edu/~poneil/lsmtree.pdf)
 
----
+***
 
 ## 🤝 贡献指南
 
@@ -400,43 +386,51 @@ netstat -an | grep 16379
 - 编写单元测试
 - 保持代码整洁
 
----
+***
 
 ## 📄 许可证
 
 本项目采用 MIT 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。
 
----
+***
 
 ## 🎯 路线图
 
 ### v1.0 (已完成)
+
 - ✅ 基础 Redis 命令支持
 - ✅ LSM Tree 持久化引擎
 - ✅ 多数据库支持
 - ✅ 过期键管理
 
 ### v1.1 (计划中)
+
 - [ ] 事务支持 (MULTI/EXEC)
 - [ ] Pipeline 优化
 - [ ] Lua 脚本支持
 - [ ] RDB 快照
 
 ### v2.0 (未来)
+
 - [ ] 主从复制
 - [ ] 分片集群
 - [ ] 分布式事务
 - [ ] 监控 Dashboard
 
----
+***
+
+## 👥 作者
+
+TZJ-BYTE
+
+***
 
 ## 📞 联系方式
 
-- **项目地址**: https://github.com/TZJ-BYTE/RediGo
-- **问题反馈**: https://github.com/TZJ-BYTE/RediGo/issues
-- **团队邮箱**: team@redigo.dev
+- **项目地址**: <https://github.com/TZJ-BYTE/RediGo>
+- **问题反馈**: <https://github.com/TZJ-BYTE/RediGo/issues>
 
----
+***
 
 **RediGo** - 让 Redis 协议实现更简单！ 🚀
 

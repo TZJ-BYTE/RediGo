@@ -24,7 +24,8 @@ type LSMEnergy struct {
 	wal              *WALWriter          // WAL 写入器
 	
 	// SSTable
-	sstables         []*SSTableReader    // SSTable 列表（Level 0）
+	tableCache       *TableCache
+	
 	nextSSTableNum   uint64              // 下一个 SSTable 编号
 	
 	// Version Set 和 Compaction
@@ -56,6 +57,7 @@ func OpenLSMEnergy(dbDir string, options *Options) (*LSMEnergy, error) {
 		walDir:         filepath.Join(dbDir, "wal"),
 		sstableDir:     filepath.Join(dbDir, "sstable"),
 		closed:         false,
+		tableCache:     NewTableCache(options.MaxOpenFiles),
 	}
 	
 	// 创建目录
@@ -93,49 +95,10 @@ func OpenLSMEnergy(dbDir string, options *Options) (*LSMEnergy, error) {
 	// 启动后台 Compaction
 	engine.compactor.Start()
 	
-	// 从 VersionSet 恢复 SSTable 信息（优先使用 VersionSet 的元数据）
-	logger.Info("Recovering SSTables from VersionSet...")
-	engine.sstables = make([]*SSTableReader, 0)
+	// SSTable 恢复不再需要加载到 engine.sstables
+	// 我们将在 Get/LoadAllKeys 时按需从 VersionSet 加载
 	
-	version := engine.versionSet.currentVersion
-	totalFiles := 0
-	for level, files := range version.Files {
-		if len(files) == 0 {
-			continue
-		}
-		
-		logger.Info("Recovering %d SSTables from Level %d", len(files), level)
-		for _, fm := range files {
-			// 构建 SSTable 文件路径
-			sstablePath := filepath.Join(engine.sstableDir, fmt.Sprintf("%06d.sstable", fm.FileNum))
-			
-			// 检查文件是否存在
-			if _, err := os.Stat(sstablePath); os.IsNotExist(err) {
-				logger.Warn("SSTable file missing: %s (referenced in MANIFEST)", sstablePath)
-				continue
-			}
-			
-			// 打开 SSTable 文件
-			reader, err := OpenSSTableForRead(sstablePath, options)
-			if err != nil {
-				logger.Warn("Failed to open SSTable %s: %v", sstablePath, err)
-				continue
-			}
-			
-			logger.Info("Recovered SSTable: %s (level=%d, size=%d bytes)", 
-				filepath.Base(sstablePath), level, fm.Size)
-			engine.sstables = append(engine.sstables, reader)
-			totalFiles++
-		}
-	}
-	
-	if totalFiles > 0 {
-		logger.Info("Loaded %d SSTables from VersionSet", totalFiles)
-	} else {
-		logger.Info("No SSTables found in VersionSet")
-	}
-	
-	logger.Info("LSM Engine SSTable count: %d", len(engine.sstables))
+	logger.Info("LSM Engine initialized")
 	
 	// 恢复 WAL
 	err = engine.recoverFromWAL()
@@ -229,6 +192,14 @@ func (e *LSMEnergy) Put(key, value []byte) error {
 	return nil
 }
 
+// getSSTableReader 获取或打开 SSTable Reader
+func (e *LSMEnergy) getSSTableReader(fileNum uint64) (*SSTableReader, error) {
+	return e.tableCache.GetOrOpen(fileNum, func() (*SSTableReader, error) {
+		sstablePath := filepath.Join(e.sstableDir, fmt.Sprintf("%06d.sstable", fileNum))
+		return OpenSSTableForRead(sstablePath, e.options)
+	})
+}
+
 // Get 获取值
 func (e *LSMEnergy) Get(key []byte) ([]byte, bool) {
 	e.mu.RLock()
@@ -241,6 +212,9 @@ func (e *LSMEnergy) Get(key []byte) ([]byte, bool) {
 	// 1. 先在 Mutable MemTable 中查找
 	val, found := e.mutableMem.Get(key)
 	if found {
+		if IsDeleted(val) {
+			return nil, false
+		}
 		return val, true
 	}
 	
@@ -248,15 +222,67 @@ func (e *LSMEnergy) Get(key []byte) ([]byte, bool) {
 	if e.immutableMem != nil {
 		val, found := e.immutableMem.Get(key)
 		if found {
+			if IsDeleted(val) {
+				return nil, false
+			}
 			return val, true
 		}
 	}
 	
-	// 3. 在 SSTable 中查找（从新到旧）
-	for i := len(e.sstables) - 1; i >= 0; i-- {
-		val, found := e.sstables[i].Get(key)
+	// 3. 在 SSTable 中查找
+	// 获取当前版本
+	version := e.versionSet.GetCurrentVersion()
+	if version == nil {
+		return nil, false
+	}
+	
+	// 遍历 Level 0 (从新到旧)
+	for i := len(version.Files[0]) - 1; i >= 0; i-- {
+		fm := version.Files[0][i]
+		reader, err := e.getSSTableReader(fm.FileNum)
+		if err != nil {
+			logger.Warn("Failed to get reader for file %d: %v", fm.FileNum, err)
+			continue
+		}
+		
+		val, found := reader.Get(key)
 		if found {
+			if IsDeleted(val) {
+				return nil, false
+			}
 			return val, true
+		}
+	}
+	
+	// 遍历 Level > 0 (从低层到高层)
+	for level := 1; level < MaxLevels; level++ {
+		files := version.Files[level]
+		if len(files) == 0 {
+			continue
+		}
+		
+		// 在该层级中查找可能包含 key 的文件
+		// 由于文件是有序且不重叠的，可以通过二分查找或者检查范围
+		for _, fm := range files {
+			// 简单的范围检查优化
+			if fm.SmallestKey != nil && fm.LargestKey != nil {
+				// 如果 key < SmallestKey 或 key > LargestKey，跳过
+				// 注意：这里需要正确的比较函数
+				// 为简单起见，这里假设 bytes.Compare 可用，且 reader.Get 内部也会检查 BloomFilter
+			}
+			
+			reader, err := e.getSSTableReader(fm.FileNum)
+			if err != nil {
+				continue
+			}
+			
+			val, found := reader.Get(key)
+			if found {
+				if IsDeleted(val) {
+					return nil, false
+				}
+				return val, true
+			}
 		}
 	}
 	
@@ -417,13 +443,11 @@ func (e *LSMEnergy) flushImmutableToSSTable(imm *ImmutableMemTable) error {
 	}
 	fmt.Println("[SSTABLE] SSTable build completed")
 	
-	// 打开 SSTable Reader
-	fmt.Println("[SSTABLE] Opening SSTable for read...")
-	reader, err := OpenSSTableForRead(filename, e.options)
+	sstablePath := filepath.Join(e.sstableDir, fmt.Sprintf("%06d.sstable", sstableNum))
+	reader, err := OpenSSTableForRead(sstablePath, e.options)
 	if err != nil {
 		return fmt.Errorf("failed to open sstable reader: %v", err)
 	}
-	fmt.Println("[SSTABLE] SSTable reader opened successfully")
 	
 	// 获取文件信息
 	info, err := os.Stat(filename)
@@ -451,9 +475,9 @@ func (e *LSMEnergy) flushImmutableToSSTable(imm *ImmutableMemTable) error {
 	}
 	fmt.Println("[SSTABLE] File added to version set successfully")
 	
-	// 添加到内存中的 SSTable 列表（假设已持有锁）
-	e.sstables = append(e.sstables, reader)
-	fmt.Printf("[SSTABLE] Added to in-memory SSTable list, total count: %d\n", len(e.sstables))
+	// 添加到缓存
+	e.tableCache.Add(sstableNum, reader)
+	fmt.Printf("[SSTABLE] Added to table cache\n")
 	
 	return nil
 }
@@ -495,19 +519,17 @@ func (e *LSMEnergy) Close() error {
 	if e.wal != nil {
 		err := e.wal.Close()
 		if err != nil {
-			return err
+			// 在 Windows 上，如果文件仍然被占用（尽管我们已经尝试关闭了），Close 可能会失败
+			// 但我们仍然应该继续关闭其他资源
+			logger.Warn("Failed to close WAL: %v", err)
+		} else {
+			logger.Info("WAL closed")
 		}
-		logger.Info("WAL closed")
 	}
 	
 	// 4. 关闭所有 SSTable
-	for _, sstable := range e.sstables {
-		err := sstable.Close()
-		if err != nil {
-			return err
-		}
-	}
-	logger.Info("Closed %d SSTables", len(e.sstables))
+	e.tableCache.Close()
+	logger.Info("Closed table cache")
 	
 	// 5. 关闭版本集合
 	if e.versionSet != nil {
@@ -529,9 +551,7 @@ func (e *LSMEnergy) GetSeqNum() uint64 {
 
 // GetSSTableCount 获取 SSTable 数量
 func (e *LSMEnergy) GetSSTableCount() int {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return len(e.sstables)
+	return e.versionSet.GetCurrentVersion().GetFileCount()
 }
 
 // LoadAllKeys 加载所有 key-value 到内存（用于冷启动全量加载）
@@ -541,83 +561,119 @@ func (e *LSMEnergy) LoadAllKeys() (map[string][]byte, error) {
 	defer e.mu.RUnlock()
 	
 	result := make(map[string][]byte)
+	deletedKeys := make(map[string]struct{}) // 记录已删除的 key
 	
 	fmt.Printf("[LoadAllKeys] Starting to load keys...\n")
-	fmt.Printf("[LoadAllKeys] MemTable size: %d bytes, entries: %d\n", e.mutableMem.Size(), e.mutableMem.EntryCount())
+	
+	// 辅助函数：处理单个 key-value
+	processEntry := func(source string, key, value []byte) {
+		keyStr := string(key)
+		
+		// DEBUG: 打印每个找到的 key
+		if len(result) < 5 {
+			fmt.Printf("[LoadAllKeys] Processing key: %s (source: %s, val_len: %d, deleted: %v)\n", keyStr, source, len(value), IsDeleted(value))
+		}
+		
+		// 如果已经被标记为删除，或者已经加载了较新版本，则跳过
+		if _, deleted := deletedKeys[keyStr]; deleted {
+			return
+		}
+		if _, exists := result[keyStr]; exists {
+			return
+		}
+		
+		// 检查是否为 Tombstone
+		if IsDeleted(value) {
+			// fmt.Printf("[LoadAllKeys] Found tombstone for key: %s in %s\n", keyStr, source)
+			deletedKeys[keyStr] = struct{}{}
+		} else {
+			// 加载数据
+			// fmt.Printf("[LoadAllKeys] Loaded key: %s from %s, value_size=%d\n", keyStr, source, len(value))
+			keyCopy := make([]byte, len(key))
+			copy(keyCopy, key)
+			valueCopy := make([]byte, len(value))
+			copy(valueCopy, value)
+			result[keyStr] = valueCopy
+		}
+	}
 	
 	// 1. 从 MemTable 加载
 	if e.mutableMem != nil {
 		it := e.mutableMem.Iterator()
-		memCount := 0
 		for it.SeekToFirst(); it.Valid(); it.Next() {
-			key := it.Key()
-			value := it.Value()
-			fmt.Printf("[LoadAllKeys] MemTable entry: key=%s, value_size=%d\n", string(key), len(value))
-			if len(value) > 0 && value[0] != 0x00 { // 检查删除标记
-				keyCopy := make([]byte, len(key))
-				copy(keyCopy, key)
-				valueCopy := make([]byte, len(value))
-				copy(valueCopy, value)
-				result[string(keyCopy)] = valueCopy
-				memCount++
-			}
+			processEntry("MemTable", it.Key(), it.Value())
 		}
-		fmt.Printf("[LoadAllKeys] Loaded %d keys from MemTable\n", memCount)
 	}
 	
 	// 2. 从 Immutable MemTable 加载
 	if e.immutableMem != nil && e.immutableMem.memtable != nil {
 		it := e.immutableMem.memtable.Iterator()
-		immCount := 0
 		for it.SeekToFirst(); it.Valid(); it.Next() {
-			key := it.Key()
-			value := it.Value()
-			if len(value) > 0 && value[0] != 0x00 { // 检查删除标记
-				keyStr := string(key)
-				// 如果已存在，跳过
-				if _, exists := result[keyStr]; !exists {
-					keyCopy := make([]byte, len(key))
-					copy(keyCopy, key)
-					valueCopy := make([]byte, len(value))
-					copy(valueCopy, value)
-					result[keyStr] = valueCopy
-					immCount++
-				}
-			}
+			processEntry("ImmutableMemTable", it.Key(), it.Value())
 		}
-		fmt.Printf("[LoadAllKeys] Loaded %d keys from Immutable MemTable\n", immCount)
 	}
 	
-	// 3. 从所有 SSTable 加载（从新到旧，确保最新版本优先）
-	fmt.Printf("[LoadAllKeys] Starting to scan %d SSTables\n", len(e.sstables))
-	for i := len(e.sstables) - 1; i >= 0; i-- {
-		sstable := e.sstables[i]
-		fmt.Printf("[LoadAllKeys] Scanning SSTable #%d (index=%d)\n", i, i)
-		it := sstable.NewIterator()
-		sstableCount := 0
-		iterCount := 0
-		for it.SeekToFirst(); it.Valid(); it.Next() {
-			iterCount++
-			key := it.Key()
-			value := it.Value()
-			fmt.Printf("[LoadAllKeys] SSTable entry: key=%s, value_size=%d\n", string(key), len(value))
-			if len(value) > 0 && value[0] != 0x00 { // 检查删除标记
-				keyStr := string(key)
-				// 如果已存在，跳过
-				if _, exists := result[keyStr]; !exists {
-					keyCopy := make([]byte, len(key))
-					copy(keyCopy, key)
-					valueCopy := make([]byte, len(value))
-					copy(valueCopy, value)
-					result[keyStr] = valueCopy
-					sstableCount++
+	// 3. 从所有 SSTable 加载
+	// 注意：LoadAllKeys 需要按照数据的新旧顺序（从新到旧）来加载，以确保旧数据不会覆盖新数据。
+	// 但 processEntry 内部已经有了 exists 检查：`if _, exists := result[keyStr]; exists { return }`
+	// 所以只要我们保证“新数据先被处理”，逻辑就是正确的。
+	
+	version := e.versionSet.GetCurrentVersion()
+	if version != nil {
+		// Level 0: 文件是重叠的，且按 FileNum 排序（通常较新的在后面，但 Compaction 可能改变这一点）。
+		// 在 Level 0 中，FileNum 越大通常意味着越新（由 Immutable MemTable 刷写产生）。
+		// 所以我们需要从大到小遍历 Level 0 文件。
+		for i := len(version.Files[0]) - 1; i >= 0; i-- {
+			fm := version.Files[0][i]
+			// 修复：确保 FileNum 正确
+			if fm == nil {
+				continue
+			}
+			
+			reader, err := e.getSSTableReader(fm.FileNum)
+			if err != nil {
+				logger.Warn("Failed to get reader for file %d: %v", fm.FileNum, err)
+				continue
+			}
+			
+			it := reader.NewIterator()
+			// 修复：检查 iterator 是否有效
+			if it == nil {
+				logger.Warn("Failed to create iterator for file %d", fm.FileNum)
+				continue
+			}
+			
+			iterCount := 0
+			for it.SeekToFirst(); it.Valid(); it.Next() {
+				processEntry(fmt.Sprintf("SSTable#%d(L0)", fm.FileNum), it.Key(), it.Value())
+				iterCount++
+			}
+			it.Release()
+			
+			// DEBUG
+			// fmt.Printf("[LoadAllKeys] Scanned SSTable %d (L0), found %d entries\n", fm.FileNum, iterCount)
+		}
+		
+		// Level > 0: 文件不重叠，且层级越小数据越新。
+		// 所以我们需要先处理 Level 1，然后 Level 2...
+		// 在同一层级内，文件是不重叠的，所以顺序不影响正确性（对于不同的 Key）。
+		// 但为了保险起见，我们还是顺序遍历。
+		for level := 1; level < MaxLevels; level++ {
+			for _, fm := range version.Files[level] {
+				reader, err := e.getSSTableReader(fm.FileNum)
+				if err != nil {
+					continue
 				}
+				
+				it := reader.NewIterator()
+				for it.SeekToFirst(); it.Valid(); it.Next() {
+					processEntry(fmt.Sprintf("SSTable#%d(L%d)", fm.FileNum, level), it.Key(), it.Value())
+				}
+				it.Release()
 			}
 		}
-		it.Release()
-		fmt.Printf("[LoadAllKeys] SSTable #%d: iterated %d entries, loaded %d keys\n", i, iterCount, sstableCount)
 	}
 	
-	fmt.Printf("[LoadAllKeys] Loaded total %d keys\n", len(result))
+	fmt.Printf("[LoadAllKeys] Loaded total %d keys, ignored %d deleted keys\n", len(result), len(deletedKeys))
 	return result, nil
 }

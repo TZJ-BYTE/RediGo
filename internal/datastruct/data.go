@@ -10,9 +10,12 @@ import (
 
 // 初始化时注册所有可能的类型
 func init() {
-	gob.Register(String{})
-	gob.Register(List{})
-	gob.Register(Hash{})
+	// 注册指针类型，确保 gob 解码时还原为指针
+	gob.Register(&String{})
+	gob.Register(&List{})
+	gob.Register(&Hash{})
+	gob.Register(&Set{})
+	gob.Register(&ZSet{})
 }
 
 // DataValue 存储的数据值结构
@@ -32,6 +35,10 @@ func (dv *DataValue) IsExpired() bool {
 // Serialize 序列化 DataValue
 func (dv *DataValue) Serialize() ([]byte, error) {
 	var buf bytes.Buffer
+
+	// 写入前缀 0x01，防止数据以 0x00 开头被误判为删除标记
+	buf.WriteByte(0x01)
+
 	encoder := gob.NewEncoder(&buf)
 	
 	// 先写入 ExpireTime
@@ -41,7 +48,9 @@ func (dv *DataValue) Serialize() ([]byte, error) {
 	}
 	
 	// 再写入 Value
-	err = encoder.Encode(dv.Value)
+	// 注意：必须传入接口的指针，以便 Gob 编码类型信息，
+	// 这样解码时 Decode(&interface{}) 才能正确工作。
+	err = encoder.Encode(&dv.Value)
 	if err != nil {
 		return nil, err
 	}
@@ -51,13 +60,27 @@ func (dv *DataValue) Serialize() ([]byte, error) {
 
 // Deserialize 反序列化 DataValue
 func DeserializeDataValue(data []byte) (*DataValue, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("empty data")
+	}
+
 	buf := bytes.NewBuffer(data)
+	
+	// 检查并去除前缀 0x01
+	prefix, err := buf.ReadByte()
+	if err == nil {
+		if prefix != 0x01 {
+			// 没有前缀，回退（尝试兼容旧数据）
+			buf.UnreadByte()
+		}
+	}
+	
 	decoder := gob.NewDecoder(buf)
 	
 	dv := &DataValue{}
 	
 	// 先读取 ExpireTime
-	err := decoder.Decode(&dv.ExpireTime)
+	err = decoder.Decode(&dv.ExpireTime)
 	if err != nil {
 		return nil, err
 	}

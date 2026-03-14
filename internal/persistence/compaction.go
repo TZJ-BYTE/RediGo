@@ -257,8 +257,23 @@ func (c *Compactor) mergeFiles(inputFiles, overlapFiles []*FileMetadata, outputL
 	// 收集所有输入文件的 Reader
 	readers := make([]*SSTableReader, 0, len(inputFiles)+len(overlapFiles))
 	
+	// 处理输入文件（当前层级）
+	// 如果是 Level 0，需要反转顺序，确保最新的文件（FileNum 较大）排在前面
+	// 这样 MergeIterator 在遇到相同 key 时会优先选择前面的（即最新的）
+	currentInputFiles := make([]*FileMetadata, len(inputFiles))
+	copy(currentInputFiles, inputFiles)
+	
+	// 假设 outputLevel = inputLevel + 1
+	// 如果 inputLevel 是 0，则 outputLevel 是 1
+	if outputLevel == 1 {
+		// 反转 Level 0 文件 (旧->新 ===> 新->旧)
+		for i, j := 0, len(currentInputFiles)-1; i < j; i, j = i+1, j-1 {
+			currentInputFiles[i], currentInputFiles[j] = currentInputFiles[j], currentInputFiles[i]
+		}
+	}
+	
 	// 打开输入文件
-	allFiles := append(inputFiles, overlapFiles...)
+	allFiles := append(currentInputFiles, overlapFiles...)
 	for _, fm := range allFiles {
 		sstablePath := filepath.Join(sstableDir, fmt.Sprintf("%06d.sstable", fm.FileNum))
 		reader, err := OpenSSTableForRead(sstablePath, c.options)

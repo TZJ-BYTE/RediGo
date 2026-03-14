@@ -339,6 +339,67 @@ func TestBlockHandle_EncodeDecode(t *testing.T) {
 	}
 }
 
+func TestSSTableIterator_CrossBlock(t *testing.T) {
+	// Create a temporary directory
+	tmpDir, err := os.MkdirTemp("", "sstable_iterator_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	filename := fmt.Sprintf("%s/test.sstable", tmpDir)
+	
+	// Use a small block size to force multiple blocks
+	options := DefaultOptions()
+	options.BlockSize = 1024 // 1KB block size
+	
+	builder, err := NewSSTableBuilder(filename, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Add enough entries to create multiple blocks
+	numEntries := 100
+	for i := 0; i < numEntries; i++ {
+		key := []byte(fmt.Sprintf("key%04d", i))
+		value := []byte(fmt.Sprintf("value%04d", i))
+		if err := builder.Add(key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := builder.Finish(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open for reading
+	reader, err := OpenSSTableForRead(filename, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	// Iterate and verify
+	iter := reader.NewIterator()
+	iter.SeekToFirst()
+
+	count := 0
+	for iter.Valid() {
+		key := string(iter.Key())
+		expectedKey := fmt.Sprintf("key%04d", count)
+		if key != expectedKey {
+			t.Errorf("Expected key %s, got %s", expectedKey, key)
+		}
+		
+		count++
+		iter.Next()
+	}
+
+	if count != numEntries {
+		t.Errorf("Expected %d entries, got %d", numEntries, count)
+	}
+}
+
 func BenchmarkSSTableBuilder_Add(b *testing.B) {
 	tmpFile := "/tmp/bench_sstable.sst"
 	defer os.Remove(tmpFile)

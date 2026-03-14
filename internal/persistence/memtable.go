@@ -65,13 +65,29 @@ func (mt *MemTable) Delete(key []byte) {
 	mt.lock.Lock()
 	defer mt.lock.Unlock()
 
-	value, exists := mt.skiplist.Get(key)
+	// 使用 Tombstone 标记删除，而不是直接从 MemTable 移除
+	// 这样可以确保删除操作被持久化到 SSTable，覆盖旧数据
+	
+	// 估算写入的大小
+	keyLen := len(key)
+	valueLen := len(Tombstone)
+	estimatedSize := int32(keyLen + valueLen + 16) // 16 bytes overhead
+
+	// 获取旧值用于更新 size
+	oldValue, exists := mt.skiplist.Get(key)
+	
+	// 插入 Tombstone
+	mt.skiplist.Insert(key, Tombstone)
+
+	// 更新大小统计
 	if exists {
-		mt.skiplist.Delete(key)
-		// 更新大小统计
-		removedSize := int32(len(key) + len(value) + 16)
-		atomic.AddInt32(&mt.size, -removedSize)
-		atomic.AddInt64(&mt.entryCount, -1)
+		// 更新操作：减去旧值大小，加上 Tombstone 大小
+		oldSize := int32(len(key) + len(oldValue) + 16)
+		atomic.AddInt32(&mt.size, estimatedSize-oldSize)
+	} else {
+		// 新增删除标记
+		atomic.AddInt32(&mt.size, estimatedSize)
+		atomic.AddInt64(&mt.entryCount, 1)
 	}
 }
 

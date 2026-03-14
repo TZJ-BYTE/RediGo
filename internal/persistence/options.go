@@ -50,6 +50,9 @@ type Options struct {
 	
 	// UseCache 是否使用 Block Cache
 	UseCache bool
+
+	// MaxOpenFiles 最大打开文件数（SSTable Cache 容量），默认 500
+	MaxOpenFiles int
 	
 	// ========== WAL 配置 ==========
 	
@@ -93,8 +96,9 @@ func DefaultOptions() *Options {
 		BloomFPRate:    0.01, // 1%
 		
 		// Cache 配置：8MB
-		CacheSize: 8 * 1024 * 1024,
-		UseCache:  true,
+		CacheSize:    8 * 1024 * 1024,
+		UseCache:     true,
+		MaxOpenFiles: 500,
 		
 		// WAL 配置
 		WriteAheadLog: true,
@@ -124,6 +128,10 @@ func (o *Options) Validate() error {
 	
 	if o.MaxLevels < 3 {
 		o.MaxLevels = 7
+	}
+	
+	if o.MaxOpenFiles < 10 {
+		o.MaxOpenFiles = 10
 	}
 	
 	return nil
