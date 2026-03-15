@@ -40,7 +40,32 @@ make build
 go build -o bin/redigo-server cmd/server/main.go
 ```
 
-### 启动服务器
+### 运行与控制（推荐）
+
+推荐优先使用 `redigo` 脚本进行启动/停止/查看状态/查看日志。
+
+**Linux/macOS**
+
+```bash
+chmod +x ./redigo
+./redigo start
+./redigo status
+./redigo logs --follow --tail 200
+./redigo client 127.0.0.1 16379
+./redigo stop
+```
+
+**Windows (PowerShell)**
+
+```powershell
+.\redigo start
+.\redigo status
+.\redigo logs --follow --tail 200
+.\redigo client 127.0.0.1 16379
+.\redigo stop
+```
+
+### 手动启动（可选）
 
 ```bash
 ./bin/redigo-server
@@ -130,49 +155,19 @@ RediGo/
 │   └── db_*/                # 各数据库的 LSM 文件
 │
 └── logs/                     # 日志目录（gitignore）
-    └── server.log
+    ├── redigo.pid            # 后台服务 PID（脚本生成）
+    ├── redigo.log            # 服务端日志（默认）
+    ├── server.out.log        # stdout（脚本重定向）
+    └── server.err.log        # stderr（脚本重定向）
 ```
 
 ***
 
 ## 🔧 配置说明
 
-### 配置文件示例
+目前服务端配置来自默认配置函数（未提供 `config.yml` 加载/命令行参数覆盖）。如需修改端口、网络引擎、持久化目录、日志路径等，请直接编辑：
 
-```yaml
-# config.yml
-server:
-  host: "127.0.0.1"
-  port: 16379
-  network_type: "std"        # 网络类型：std (标准库) | gnet (高性能 Reactor)
-  
-database:
-  count: 16  # 数据库数量
-  
-persistence:
-  enabled: true              # 启用持久化
-  type: "lsm"                # 持久化类型：memory | lsm
-  data_dir: "./data"         # 数据目录
-  
-  # LSM 专用配置
-  mem_table_size: 4MB        # MemTable 大小
-  max_mem_tables: 4          # 最大 MemTable 数量
-  sstable_size: 10MB         # SSTable 大小
-  bloom_filter_bits: 10      # Bloom Filter 位数
-  block_cache_size: 100MB    # Block Cache 大小
-  max_open_files: 500        # 最大打开文件数
-  
-  # 冷启动策略
-  cold_start_strategy: "lazy_load"  # no_load | load_all | lazy_load
-```
-
-### 冷启动策略说明
-
-| 策略           | 配置值         | 说明               | 适用场景        |
-| ------------ | ----------- | ---------------- | ----------- |
-| **NoLoad**   | `no_load`   | 不加载历史数据（默认）      | 快速启动，作为新实例  |
-| **LoadAll**  | `load_all`  | 启动时全量加载到内存       | 小数据量，要求快速读取 |
-| **LazyLoad** | `lazy_load` | 懒加载，读取时 fallback | 大数据量，节省内存   |
+- `config.DefaultConfig()`：见 `config/config.go`
 
 ***
 
