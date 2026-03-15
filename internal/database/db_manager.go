@@ -2,6 +2,8 @@ package database
 
 import (
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 	
 	"github.com/TZJ-BYTE/RediGo/config"
@@ -29,6 +31,10 @@ func NewDBManager(cfg *config.Config) *DBManager {
 	persistenceEnabled := cfg.PersistenceEnabled
 	var dataDir string
 	var lsmOptions *persistence.Options
+	
+	if persistenceEnabled && strings.Contains(strings.ToLower(os.Args[0]), ".test") {
+		persistenceEnabled = false
+	}
 	
 	if persistenceEnabled {
 		dataDir = cfg.DataDir

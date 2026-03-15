@@ -40,10 +40,12 @@ func (c *HSetCommand) Execute(db *database.Database, args []string) *protocol.Re
 	_, fieldExists := hash.Data[field]
 	hash.Set(field, value)
 	
-	db.Set(key, &datastruct.DataValue{
+	if err := db.Set(key, &datastruct.DataValue{
 		Value:      hash,
 		ExpireTime: 0,
-	})
+	}); err != nil {
+		return protocol.MakeError(err)
+	}
 	
 	// 如果字段不存在，返回 1；如果字段已存在并更新了值，返回 0
 	if !fieldExists {
@@ -113,10 +115,12 @@ func (c *HMSetCommand) Execute(db *database.Database, args []string) *protocol.R
 		hash.Set(field, value)
 	}
 	
-	db.Set(key, &datastruct.DataValue{
+	if err := db.Set(key, &datastruct.DataValue{
 		Value:      hash,
 		ExpireTime: 0,
-	})
+	}); err != nil {
+		return protocol.MakeError(err)
+	}
 	
 	return protocol.MakeSimpleString("OK")
 }
@@ -377,10 +381,12 @@ func (c *HIncrByCommand) Execute(db *database.Database, args []string) *protocol
 	newValue := current + delta
 	hash.Set(field, strconv.FormatInt(newValue, 10))
 	
-	db.Set(key, &datastruct.DataValue{
+	if err := db.Set(key, &datastruct.DataValue{
 		Value:      hash,
 		ExpireTime: 0,
-	})
+	}); err != nil {
+		return protocol.MakeError(err)
+	}
 	
 	return protocol.MakeInteger(newValue)
 }
@@ -429,10 +435,12 @@ func (c *HIncrByFloatCommand) Execute(db *database.Database, args []string) *pro
 	newValue := current + delta
 	hash.Set(field, strconv.FormatFloat(newValue, 'f', -1, 64))
 	
-	db.Set(key, &datastruct.DataValue{
+	if err := db.Set(key, &datastruct.DataValue{
 		Value:      hash,
 		ExpireTime: 0,
-	})
+	}); err != nil {
+		return protocol.MakeError(err)
+	}
 	
 	return protocol.MakeBulkString(strconv.FormatFloat(newValue, 'f', -1, 64))
 }

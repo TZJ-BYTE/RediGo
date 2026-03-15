@@ -3,7 +3,10 @@ package database
 import (
 	"fmt"
 	"hash/fnv"
+	"math"
+	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/TZJ-BYTE/RediGo/config"
@@ -11,6 +14,10 @@ import (
 	"github.com/TZJ-BYTE/RediGo/internal/persistence"
 	"github.com/TZJ-BYTE/RediGo/pkg/logger"
 )
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
 
 // DatabaseType 数据库类型
 type DatabaseType int
@@ -48,6 +55,11 @@ type Database struct {
 	// LSM 引擎（可选）
 	lsmEngine *persistence.LSMEnergy
 	config    *DatabaseConfig
+
+	// 内存管理
+	usedMemory     int64  // 当前使用内存（字节），原子操作
+	maxMemory      int64  // 最大内存限制（字节）
+	evictionPolicy string // 淘汰策略
 }
 
 // DefaultDatabaseConfig 返回默认配置
@@ -60,9 +72,12 @@ func DefaultDatabaseConfig() *DatabaseConfig {
 
 // NewDatabase 创建新数据库（使用默认配置，纯内存）
 func NewDatabase(id int) *Database {
+	cfg := config.DefaultConfig()
 	db := &Database{
-		id:     id,
-		config: DefaultDatabaseConfig(),
+		id:             id,
+		config:         DefaultDatabaseConfig(),
+		maxMemory:      cfg.MaxMemory,
+		evictionPolicy: cfg.MaxMemoryPolicy,
 	}
 	for i := 0; i < ShardCount; i++ {
 		db.shards[i] = &shard{
@@ -73,42 +88,47 @@ func NewDatabase(id int) *Database {
 }
 
 // NewDatabaseWithConfig 使用配置创建数据库
-func NewDatabaseWithConfig(id int, config *DatabaseConfig) (*Database, error) {
+func NewDatabaseWithConfig(id int, dbConfig *DatabaseConfig) (*Database, error) {
+	// 获取全局配置
+	globalConfig := config.DefaultConfig()
+
 	db := &Database{
-		id:     id,
-		config: config,
+		id:             id,
+		config:         dbConfig,
+		maxMemory:      globalConfig.MaxMemory,
+		evictionPolicy: globalConfig.MaxMemoryPolicy,
 	}
 	for i := 0; i < ShardCount; i++ {
 		db.shards[i] = &shard{
 			data: make(map[string]*datastruct.DataValue),
 		}
 	}
-	
+
 	// 如果是 LSM 持久化模式，初始化 LSM 引擎
-	if config.Type == LSMPersistent {
-		if config.DataDir == "" {
+	if dbConfig.Type == LSMPersistent {
+		if dbConfig.DataDir == "" {
 			return nil, fmt.Errorf("data directory is required for LSM mode")
 		}
-		
-		options := config.Options
+
+		options := dbConfig.Options
 		if options == nil {
 			options = persistence.DefaultOptions()
 		}
-		
+
 		var err error
-		db.lsmEngine, err = persistence.OpenLSMEnergy(config.DataDir, options)
+		db.lsmEngine, err = persistence.OpenLSMEnergy(dbConfig.DataDir, options)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open LSM engine: %v", err)
 		}
-		
+
 		// 根据冷启动策略加载数据
 		strategy := getColdStartStrategyFromConfig()
-		
+
 		// 强制默认使用 lazy_load 以支持持久化测试
 		if strategy == "no_load" {
 			strategy = "lazy_load"
 		}
-		
+
 		switch strategy {
 		case "load_all":
 			// 全量加载到内存
@@ -128,7 +148,7 @@ func NewDatabaseWithConfig(id int, config *DatabaseConfig) (*Database, error) {
 			logger.Info("LSM cold start: no data loading")
 		}
 	}
-	
+
 	return db, nil
 }
 
@@ -197,16 +217,110 @@ func (db *Database) loadAllFromLSM() error {
 		shard.lock.Lock()
 		shard.data[key] = dataValue
 		shard.lock.Unlock()
+
+		// 更新内存统计
+		db.updateMemoryUsage(int64(len(key)) + dataValue.ApproximateSize())
 		keysLoaded++
 	}
 
-	logger.Info("Successfully loaded %d keys into memory map.", keysLoaded)
+	logger.Info("Successfully loaded %d keys into memory map. Used memory: %d bytes", keysLoaded, db.usedMemory)
 	return nil
 }
 
 // deserializeDataValue 反序列化 DataValue
 func deserializeDataValue(data []byte) (*datastruct.DataValue, error) {
 	return datastruct.DeserializeDataValue(data)
+}
+
+// updateMemoryUsage 更新内存使用量
+func (db *Database) updateMemoryUsage(delta int64) {
+	atomic.AddInt64(&db.usedMemory, delta)
+}
+
+// evictIfNeeded 检查内存是否超限并尝试淘汰
+func (db *Database) evictIfNeeded() bool {
+	if db.evictionPolicy == "noeviction" {
+		// 如果策略是不淘汰，检查是否超限
+		return atomic.LoadInt64(&db.usedMemory) <= db.maxMemory
+	}
+
+	for atomic.LoadInt64(&db.usedMemory) > db.maxMemory {
+		// 尝试淘汰一个 key
+		if !db.evictOneKey() {
+			// 如果无法淘汰任何 key（例如数据库为空，或者 volatile 策略下没有过期 key）
+			return false
+		}
+	}
+	return true
+}
+
+// evictOneKey 尝试淘汰一个 key
+func (db *Database) evictOneKey() bool {
+	// 尝试多次随机选择 shard，以应对数据稀疏的情况
+	maxAttempts := 1000
+	for i := 0; i < maxAttempts; i++ {
+		shardIdx := rand.Intn(ShardCount)
+		shard := db.shards[shardIdx]
+
+		shard.lock.RLock()
+		// 如果 shard 为空，尝试下一个
+		if len(shard.data) == 0 {
+			shard.lock.RUnlock()
+			continue
+		}
+		// fmt.Printf("Sampling shard %d with %d keys\n", shardIdx, len(shard.data))
+
+		// 采样
+		var bestKey string
+		bestScore := int64(math.MinInt64)
+
+		samples := 5
+		count := 0
+
+		for key, val := range shard.data {
+			score := int64(math.MinInt64)
+
+			switch db.evictionPolicy {
+			case "allkeys-lru":
+				// LRU: 越久未访问 (LastAccessedAt 越小)，分数越高
+				// Score = MaxInt64 - LastAccessedAt
+				// 为了方便比较，我们直接找 LastAccessedAt 最小的
+				score = ^val.LastAccessedAt // 取反，越小的值变成越大的值
+
+			case "volatile-lru":
+				if val.ExpireTime > 0 {
+					score = ^val.LastAccessedAt
+				}
+
+			case "allkeys-random":
+				score = 1 // 只要找到就可以
+
+			case "volatile-random":
+				if val.ExpireTime > 0 {
+					score = 1
+				}
+			}
+
+			if score > bestScore {
+				bestKey = key
+				bestScore = score
+			}
+
+			count++
+			if count >= samples {
+				break
+			}
+		}
+		shard.lock.RUnlock()
+
+		if bestKey != "" {
+			// 执行删除
+			db.Delete(bestKey)
+			return true
+		}
+	}
+
+	return false
 }
 
 // Get 获取键值
@@ -270,7 +384,12 @@ func (db *Database) Get(key string) (*datastruct.DataValue, bool) {
 }
 
 // Set 设置键值
-func (db *Database) Set(key string, value *datastruct.DataValue) {
+func (db *Database) Set(key string, value *datastruct.DataValue) error {
+	// 检查内存并尝试淘汰
+	if !db.evictIfNeeded() {
+		return fmt.Errorf("OOM command not allowed when used memory (%d) > 'maxmemory' (%d)", db.usedMemory, db.maxMemory)
+	}
+
 	shard := db.getShard(key)
 	shard.lock.Lock()
 	shard.data[key] = value
@@ -289,6 +408,11 @@ func (db *Database) Set(key string, value *datastruct.DataValue) {
 			logger.Error("Failed to serialize value for key %s: %v", key, err)
 		}
 	}
+
+	// 更新内存统计
+	memDelta := int64(len(key)) + value.ApproximateSize()
+	db.updateMemoryUsage(memDelta)
+	return nil
 }
 
 // Delete 删除键
@@ -299,7 +423,11 @@ func (db *Database) Delete(key string) bool {
 
 	// 从内存删除
 	if exists {
+		val := shard.data[key]
 		delete(shard.data, key)
+		// 更新内存统计
+		memDelta := int64(len(key)) + val.ApproximateSize()
+		db.updateMemoryUsage(-memDelta)
 	}
 	shard.lock.Unlock()
 

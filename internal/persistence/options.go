@@ -62,6 +62,13 @@ type Options struct {
 	// SyncWAL 每次写入后是否同步到磁盘（更安全但更慢）
 	SyncWAL bool
 	
+	// ========== WiscKey (Value Log) 配置 ==========
+	
+	// ValueThreshold 写入 Value Log 的阈值（字节）
+	// 小于此值的 Value 将直接存储在 LSM Tree 中，大于等于此值则存入 vLog
+	// 默认 64 字节。设置为 0 则所有数据都写入 vLog。设置为 -1 则所有数据都存 LSM Tree（关闭 KV 分离）。
+	ValueThreshold int
+	
 	// ========== Compaction 配置 ==========
 	
 	// L0_CompactionTrigger Level 0 文件数达到多少时触发 compaction
@@ -103,6 +110,9 @@ func DefaultOptions() *Options {
 		// WAL 配置
 		WriteAheadLog: true,
 		SyncWAL:       false, // 性能优先
+		
+		// WiscKey 配置
+		ValueThreshold: 64,
 		
 		// Compaction 配置
 		L0_CompactionTrigger:       4,

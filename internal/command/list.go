@@ -39,10 +39,12 @@ func (c *LPushCommand) Execute(db *database.Database, args []string) *protocol.R
 		list.PushLeft(v)
 	}
 	
-	db.Set(key, &datastruct.DataValue{
+	if err := db.Set(key, &datastruct.DataValue{
 		Value:      list,
 		ExpireTime: 0,
-	})
+	}); err != nil {
+		return protocol.MakeError(err)
+	}
 	
 	return protocol.MakeInteger(int64(len(list.Data)))
 }
@@ -77,10 +79,12 @@ func (c *RPushCommand) Execute(db *database.Database, args []string) *protocol.R
 		list.PushRight(v)
 	}
 	
-	db.Set(key, &datastruct.DataValue{
+	if err := db.Set(key, &datastruct.DataValue{
 		Value:      list,
 		ExpireTime: 0,
-	})
+	}); err != nil {
+		return protocol.MakeError(err)
+	}
 	
 	return protocol.MakeInteger(int64(len(list.Data)))
 }

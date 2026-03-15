@@ -39,10 +39,10 @@ temp/
 build/
 dist/
 
-# Compiled binaries (Gedis specific)
+# Compiled binaries (RediGo specific)
 bin/
-gedis-server
-gedis-client
+redigo-server
+redigo-client
 
 # Environment variables
 .env

@@ -26,7 +26,10 @@ func (c *SetCommand) Execute(db *database.Database, args []string) *protocol.Res
 		ExpireTime: 0,
 	}
 	
-	db.Set(key, dataValue)
+	err := db.Set(key, dataValue)
+	if err != nil {
+		return protocol.MakeError(err)
+	}
 	return protocol.MakeSimpleString("OK")
 }
 
@@ -236,7 +239,9 @@ func (c *IncrCommand) Execute(db *database.Database, args []string) *protocol.Re
 			Value:      &datastruct.String{Data: "1"},
 			ExpireTime: 0,
 		}
-		db.Set(key, newValue)
+		if err := db.Set(key, newValue); err != nil {
+			return protocol.MakeError(err)
+		}
 		return protocol.MakeInteger(1)
 	}
 	
@@ -259,7 +264,9 @@ func (c *IncrCommand) Execute(db *database.Database, args []string) *protocol.Re
 		Value:      &datastruct.String{Data: strconv.FormatInt(newValue, 10)},
 		ExpireTime: value.ExpireTime,
 	}
-	db.Set(key, dataValue)
+	if err := db.Set(key, dataValue); err != nil {
+		return protocol.MakeError(err)
+	}
 	
 	return protocol.MakeInteger(newValue)
 }
@@ -281,7 +288,9 @@ func (c *DecrCommand) Execute(db *database.Database, args []string) *protocol.Re
 			Value:      &datastruct.String{Data: "-1"},
 			ExpireTime: 0,
 		}
-		db.Set(key, newValue)
+		if err := db.Set(key, newValue); err != nil {
+			return protocol.MakeError(err)
+		}
 		return protocol.MakeInteger(-1)
 	}
 	
@@ -304,7 +313,9 @@ func (c *DecrCommand) Execute(db *database.Database, args []string) *protocol.Re
 		Value:      &datastruct.String{Data: strconv.FormatInt(newValue, 10)},
 		ExpireTime: value.ExpireTime,
 	}
-	db.Set(key, dataValue)
+	if err := db.Set(key, dataValue); err != nil {
+		return protocol.MakeError(err)
+	}
 	
 	return protocol.MakeInteger(newValue)
 }
@@ -326,7 +337,9 @@ func (c *MsetCommand) Execute(db *database.Database, args []string) *protocol.Re
 			Value:      &datastruct.String{Data: value},
 			ExpireTime: 0,
 		}
-		db.Set(key, dataValue)
+		if err := db.Set(key, dataValue); err != nil {
+			return protocol.MakeError(err)
+		}
 	}
 	
 	return protocol.MakeSimpleString("OK")
@@ -385,7 +398,11 @@ func (c *RenameCommand) Execute(db *database.Database, args []string) *protocol.
 	
 	// 删除旧 key，设置新 key
 	db.Delete(oldKey)
-	db.Set(newKey, value)
+	if err := db.Set(newKey, value); err != nil {
+		// 尝试恢复旧 key
+		db.Set(oldKey, value)
+		return protocol.MakeError(err)
+	}
 	
 	return protocol.MakeSimpleString("OK")
 }
@@ -414,7 +431,11 @@ func (c *RenamenxCommand) Execute(db *database.Database, args []string) *protoco
 	
 	// 删除旧 key，设置新 key
 	db.Delete(oldKey)
-	db.Set(newKey, value)
+	if err := db.Set(newKey, value); err != nil {
+		// 尝试恢复旧 key
+		db.Set(oldKey, value)
+		return protocol.MakeError(err)
+	}
 	
 	return protocol.MakeInteger(1)
 }

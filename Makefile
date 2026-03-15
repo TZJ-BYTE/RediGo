@@ -2,8 +2,8 @@
 
 # Go 参数
 GO = go
-BINARY_SERVER = bin/gedis-server
-BINARY_CLIENT = bin/gedis-client
+BINARY_SERVER = bin/redigo-server
+BINARY_CLIENT = bin/redigo-client
 
 # 默认目标
 all: build
@@ -23,12 +23,12 @@ build-client:
 
 # 运行服务器
 run: build-server
-	@echo "启动 Gedis 服务器..."
+	@echo "启动 RediGo 服务器..."
 	./$(BINARY_SERVER)
 
 # 运行客户端
 client: build-client
-	@echo "启动 Gedis 客户端..."
+	@echo "启动 RediGo 客户端..."
 	./$(BINARY_CLIENT)
 
 # 清理构建文件
@@ -55,7 +55,7 @@ fmt:
 
 # 帮助信息
 help:
-	@echo "Gedis Makefile"
+	@echo "RediGo Makefile"
 	@echo ""
 	@echo "可用命令:"
 	@echo "  make build     - 构建服务器和客户端"

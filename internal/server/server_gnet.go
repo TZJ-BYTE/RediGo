@@ -32,7 +32,7 @@ func NewGnetServer(cfg *config.Config) network.Server {
 
 func (s *GnetServer) Start() error {
 	addr := fmt.Sprintf("tcp://%s:%d", s.config.Host, s.config.Port)
-	logger.Info("Gedis 服务器启动在 %s (gnet)", addr)
+	logger.Info("RediGo 服务器启动在 %s (gnet)", addr)
 	return gnet.Run(s, addr, gnet.WithMulticore(true), gnet.WithReusePort(true))
 }
 

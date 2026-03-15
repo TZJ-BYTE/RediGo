@@ -1,6 +1,7 @@
 package persistence
 
 import (
+	"bytes"
 	"encoding/binary"
 	"hash/crc32"
 	"os"
@@ -13,8 +14,7 @@ var Tombstone = []byte{0x00}
 
 // IsDeleted 检查是否为删除标记
 func IsDeleted(value []byte) bool {
-	// 只要以 0x00 开头，就认为是删除（兼容现有逻辑）
-	return len(value) > 0 && value[0] == 0x00
+	return bytes.Equal(value, Tombstone)
 }
 
 // ========== 字节序转换 ==========

@@ -22,7 +22,8 @@ type Config struct {
 	DBCount int `yaml:"db_count" json:"db_count"`
 	
 	// 内存配置
-	MaxMemory int64 `yaml:"max_memory" json:"max_memory"`
+	MaxMemory       int64  `yaml:"max_memory" json:"max_memory"`
+	MaxMemoryPolicy string `yaml:"max_memory_policy" json:"max_memory_policy"` // "noeviction", "allkeys-lru", "volatile-lru", "allkeys-random", "volatile-random"
 	
 	// 持久化配置
 	PersistenceEnabled bool              `yaml:"persistence_enabled" json:"persistence_enabled"`
@@ -53,7 +54,8 @@ func DefaultConfig() *Config {
 		NetworkType: "std",
 		DBCount:   16,
 		MaxMemory: 256 * 1024 * 1024, // 256MB
-		
+		MaxMemoryPolicy: "noeviction", // 默认不淘汰，内存满时报错
+
 		// 持久化配置（默认启用 LSM）
 		PersistenceEnabled: true,
 		PersistenceType:    "lsm",  // 默认使用 LSM
@@ -74,7 +76,7 @@ func DefaultConfig() *Config {
 		
 		// 日志配置
 		LogLevel: "info",
-		LogPath:  "./logs/gedis.log",
+		LogPath:  "./logs/redigo.log",
 	}
 }
 

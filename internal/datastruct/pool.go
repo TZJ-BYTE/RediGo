@@ -2,6 +2,7 @@ package datastruct
 
 import (
 	"sync"
+	"time"
 )
 
 var (
@@ -22,13 +23,16 @@ var (
 
 // NewDataValue 从池中获取 DataValue
 func NewDataValue() *DataValue {
-	return DataValuePool.Get().(*DataValue)
+	dv := DataValuePool.Get().(*DataValue)
+	dv.LastAccessedAt = time.Now().UnixMilli()
+	return dv
 }
 
 // FreeDataValue 将 DataValue 放回池中
 func FreeDataValue(dv *DataValue) {
 	dv.Value = nil
 	dv.ExpireTime = 0
+	dv.LastAccessedAt = 0
 	DataValuePool.Put(dv)
 }
 

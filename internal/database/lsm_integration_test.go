@@ -39,7 +39,9 @@ func TestLSMIntegration(t *testing.T) {
 	}
 
 	for key, value := range testData {
-		db.Set(key, &datastruct.DataValue{Value: &datastruct.String{Data: value}})
+		if err := db.Set(key, &datastruct.DataValue{Value: &datastruct.String{Data: value}}); err != nil {
+			t.Fatalf("Set failed: %v", err)
+		}
 	}
 
 	// 测试读取
@@ -98,7 +100,9 @@ func TestLSMRecovery(t *testing.T) {
 		key := fmt.Sprintf("key%d", i)
 		value := fmt.Sprintf("value%d", i)
 		// 使用 *datastruct.String，模拟真实环境
-		db1.Set(key, &datastruct.DataValue{Value: &datastruct.String{Data: value}})
+		if err := db1.Set(key, &datastruct.DataValue{Value: &datastruct.String{Data: value}}); err != nil {
+			t.Fatalf("Set failed: %v", err)
+		}
 	}
 
 	// 强制刷写到 SSTable（通过触发 MemTable 刷写）
@@ -195,7 +199,9 @@ func TestDBManagerWithLSM(t *testing.T) {
 
 	// 测试基本操作
 	db := manager.GetDefaultDB()
-	db.Set("test_key", &datastruct.DataValue{Value: &datastruct.String{Data: "test_value"}})
+	if err := db.Set("test_key", &datastruct.DataValue{Value: &datastruct.String{Data: "test_value"}}); err != nil {
+		t.Fatalf("Set failed: %v", err)
+	}
 
 	val, found := db.Get("test_key")
 	if !found {
@@ -211,7 +217,9 @@ func TestDBManagerWithLSM(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to get DB 1: %v", err)
 	}
-	db1.Set("db1_key", &datastruct.DataValue{Value: &datastruct.String{Data: "db1_value"}})
+	if err := db1.Set("db1_key", &datastruct.DataValue{Value: &datastruct.String{Data: "db1_value"}}); err != nil {
+		t.Fatalf("Set failed: %v", err)
+	}
 
 	// 验证两个数据库独立
 	db0 := manager.GetDefaultDB()
@@ -245,7 +253,9 @@ func BenchmarkLSMWrite(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		key := fmt.Sprintf("key%d", i)
 		value := fmt.Sprintf("value%d", i)
-		db.Set(key, &datastruct.DataValue{Value: &datastruct.String{Data: value}})
+		if err := db.Set(key, &datastruct.DataValue{Value: &datastruct.String{Data: value}}); err != nil {
+			b.Fatalf("Set failed: %v", err)
+		}
 	}
 }
 
@@ -270,7 +280,9 @@ func BenchmarkLSMRead(b *testing.B) {
 	for i := 0; i < 10000; i++ {
 		key := fmt.Sprintf("key%d", i)
 		value := fmt.Sprintf("value%d", i)
-		db.Set(key, &datastruct.DataValue{Value: &datastruct.String{Data: value}})
+		if err := db.Set(key, &datastruct.DataValue{Value: &datastruct.String{Data: value}}); err != nil {
+			b.Fatalf("Set failed: %v", err)
+		}
 	}
 
 	b.ResetTimer()

@@ -22,7 +22,7 @@ func main() {
 		os.Exit(1)
 	}
 	
-	logger.Info("正在启动 Gedis 服务器...")
+	logger.Info("正在启动 RediGo 服务器...")
 	logger.Info("配置：Host=%s, Port=%d, DBCount=%d", cfg.Host, cfg.Port, cfg.DBCount)
 	
 	// 创建服务器

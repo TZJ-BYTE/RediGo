@@ -37,13 +37,13 @@ go mod download
 ```bash
 make build
 # 或者
-go build -o bin/gedis-server cmd/server/main.go
+go build -o bin/redigo-server cmd/server/main.go
 ```
 
 ### 启动服务器
 
 ```bash
-./bin/gedis-server
+./bin/redigo-server
 ```
 
 ### 使用客户端连接
@@ -114,10 +114,17 @@ RediGo/
 │   └── utils/               # 工具函数
 │
 ├── scripts/                  # 辅助脚本
-│   └── start.sh             # 启动脚本
+│   ├── build.ps1            # Windows 构建脚本
+│   ├── clean.ps1            # Windows 清理脚本
+│   ├── test.ps1             # Windows 测试脚本
+│   └── clean.sh             # Linux/macOS 清理脚本
+│
+├── redigo                   # Linux/macOS 命令行入口
+├── redigo.ps1               # Windows 命令行入口
+├── redigo.cmd               # Windows 包装器（转发到 redigo.ps1）
 │
 ├── bin/                      # 编译输出（gitignore）
-│   └── gedis-server
+│   └── redigo-server
 │
 ├── data/                     # 数据目录（gitignore）
 │   └── db_*/                # 各数据库的 LSM 文件
@@ -319,10 +326,10 @@ DefaultRegistry.Register("MYCMD", &MyCommand{})
 
 ```bash
 # 查看详细日志
-./bin/gedis-server --log-level debug
+./bin/redigo-server --log-level debug
 
 # 查看内存使用
-ps aux | grep gedis-server
+ps aux | grep redigo-server
 
 # 监控连接数
 netstat -an | grep 16379

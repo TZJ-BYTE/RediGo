@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN_DIR="$ROOT/bin"
+LOG_DIR="$ROOT/logs"
+PID_PATH="$LOG_DIR/redigo.pid"
+SERVER_BIN="$BIN_DIR/redigo-server"
+CLIENT_BIN="$BIN_DIR/redigo-client"
+STDOUT_PATH="$LOG_DIR/server.out.log"
+STDERR_PATH="$LOG_DIR/server.err.log"
+
+mkdir -p "$BIN_DIR" "$LOG_DIR"
+
+usage() {
+  cat <<'EOF'
+用法:
+  ./redigo start
+  ./redigo stop
+  ./redigo restart
+  ./redigo status
+  ./redigo logs [--follow] [--tail N]
+  ./redigo client [host] [port]
+EOF
+}
+
+read_pid() {
+  if [[ -f "$PID_PATH" ]]; then
+    tr -d ' \r\n' < "$PID_PATH" || true
+  fi
+}
+
+is_running() {
+  local pid="$1"
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+ensure_built() {
+  (cd "$ROOT" && make build >/dev/null)
+}
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  help|-h|--help|"")
+    usage
+    exit 0
+    ;;
+  start)
+    pid="$(read_pid || true)"
+    if [[ -n "$pid" ]] && is_running "$pid"; then
+      echo "已在运行: pid=$pid"
+      exit 0
+    fi
+
+    ensure_built
+    if [[ ! -x "$SERVER_BIN" ]]; then
+      echo "找不到服务端可执行文件: $SERVER_BIN"
+      exit 1
+    fi
+
+    nohup "$SERVER_BIN" >"$STDOUT_PATH" 2>"$STDERR_PATH" &
+    new_pid="$!"
+    printf "%s" "$new_pid" > "$PID_PATH"
+    echo "启动成功: pid=$new_pid"
+    ;;
+  stop)
+    pid="$(read_pid || true)"
+    if [[ -z "$pid" ]]; then
+      echo "未找到 pid 文件: $PID_PATH"
+      exit 0
+    fi
+    if ! is_running "$pid"; then
+      rm -f "$PID_PATH"
+      echo "进程不存在: pid=$pid"
+      exit 0
+    fi
+
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      if ! is_running "$pid"; then
+        rm -f "$PID_PATH"
+        echo "已停止: pid=$pid"
+        exit 0
+      fi
+      sleep 0.1
+    done
+    kill -9 "$pid" 2>/dev/null || true
+    rm -f "$PID_PATH"
+    echo "已强制停止: pid=$pid"
+    ;;
+  restart)
+    "$ROOT/redigo" stop || true
+    "$ROOT/redigo" start
+    ;;
+  status)
+    pid="$(read_pid || true)"
+    if [[ -z "$pid" ]]; then
+      echo "状态: stopped"
+      exit 0
+    fi
+    if is_running "$pid"; then
+      echo "状态: running (pid=$pid)"
+      exit 0
+    fi
+    echo "状态: stale pid (pid=$pid)"
+    exit 0
+    ;;
+  logs)
+    follow=0
+    tail_n=200
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --follow) follow=1; shift ;;
+        --tail) tail_n="${2:-200}"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    if [[ ! -f "$STDOUT_PATH" ]]; then
+      echo "未找到日志文件: $STDOUT_PATH"
+      exit 0
+    fi
+    if [[ "$follow" -eq 1 ]]; then
+      tail -n "$tail_n" -f "$STDOUT_PATH"
+    else
+      tail -n "$tail_n" "$STDOUT_PATH"
+    fi
+    ;;
+  client)
+    ensure_built
+    if [[ ! -x "$CLIENT_BIN" ]]; then
+      echo "找不到客户端可执行文件: $CLIENT_BIN"
+      exit 1
+    fi
+    host="${1:-127.0.0.1}"
+    port="${2:-16379}"
+    exec "$CLIENT_BIN" "$host" "$port"
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
+

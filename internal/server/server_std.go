@@ -51,7 +51,7 @@ func (s *StdServer) Start() error {
 	}
 
 	s.listener = listener
-	logger.Info("Gedis 服务器启动在 %s (Standard Net)", addr)
+	logger.Info("RediGo 服务器启动在 %s (Standard Net)", addr)
 
 	for {
 		conn, err := listener.Accept()
@@ -183,6 +183,6 @@ func (s *StdServer) Stop() error {
 		}
 	}
 
-	logger.Info("=== Gedis 服务器已停止 ===")
+	logger.Info("=== RediGo 服务器已停止 ===")
 	return nil
 }

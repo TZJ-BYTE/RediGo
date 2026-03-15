@@ -20,8 +20,46 @@ func init() {
 
 // DataValue 存储的数据值结构
 type DataValue struct {
-	Value      interface{} // 实际数据
-	ExpireTime int64       // 过期时间戳，0 表示永不过期
+	Value          interface{} // 实际数据
+	ExpireTime     int64       // 过期时间戳，0 表示永不过期
+	LastAccessedAt int64       // 最后访问时间戳（毫秒），用于 LRU
+}
+
+// UpdateLastAccessed 更新最后访问时间
+func (dv *DataValue) UpdateLastAccessed() {
+	dv.LastAccessedAt = time.Now().UnixMilli()
+}
+
+// ApproximateSize 返回估算的内存大小（字节）
+func (dv *DataValue) ApproximateSize() int64 {
+	size := int64(24) // struct base overhead (approx)
+
+	switch v := dv.Value.(type) {
+	case *String:
+		size += int64(len(v.Data))
+	case *List:
+		for _, s := range v.Data {
+			size += int64(len(s)) + 16 // string header overhead
+		}
+		size += int64(len(v.Data) * 8) // slice overhead
+	case *Hash:
+		for k, val := range v.Data {
+			size += int64(len(k)) + int64(len(val)) + 32 // map entry overhead
+		}
+	case *Set:
+		for k := range v.Data {
+			size += int64(len(k)) + 24 // map entry overhead
+		}
+	case *ZSet:
+		for k := range v.Data {
+			size += int64(len(k)) + 48 // map entry + float64 overhead
+		}
+		size += int64(len(v.Scores) * 24) // slice overhead
+	case string: // 兼容纯字符串 Value
+		size += int64(len(v))
+	}
+
+	return size
 }
 
 // IsExpired 检查是否过期
@@ -36,8 +74,8 @@ func (dv *DataValue) IsExpired() bool {
 func (dv *DataValue) Serialize() ([]byte, error) {
 	var buf bytes.Buffer
 
-	// 写入前缀 0x01，防止数据以 0x00 开头被误判为删除标记
-	buf.WriteByte(0x01)
+	// 写入前缀 0x02，表示 v1.1 格式（包含 LastAccessedAt）
+	buf.WriteByte(0x02)
 
 	encoder := gob.NewEncoder(&buf)
 	
@@ -47,6 +85,12 @@ func (dv *DataValue) Serialize() ([]byte, error) {
 		return nil, err
 	}
 	
+	// 写入 LastAccessedAt
+	err = encoder.Encode(dv.LastAccessedAt)
+	if err != nil {
+		return nil, err
+	}
+
 	// 再写入 Value
 	// 注意：必须传入接口的指针，以便 Gob 编码类型信息，
 	// 这样解码时 Decode(&interface{}) 才能正确工作。
@@ -66,12 +110,14 @@ func DeserializeDataValue(data []byte) (*DataValue, error) {
 
 	buf := bytes.NewBuffer(data)
 	
-	// 检查并去除前缀 0x01
+	// 检查并去除前缀
 	prefix, err := buf.ReadByte()
 	if err == nil {
-		if prefix != 0x01 {
-			// 没有前缀，回退（尝试兼容旧数据）
+		if prefix != 0x01 && prefix != 0x02 {
+			// 没有已知前缀，回退（尝试兼容旧数据）
 			buf.UnreadByte()
+			// 假设是 v1.0 (0x01) 的变体或者无前缀旧数据，默认为 v1.0 处理逻辑
+			prefix = 0x01 
 		}
 	}
 	
@@ -87,6 +133,18 @@ func DeserializeDataValue(data []byte) (*DataValue, error) {
 		return nil, err
 	}
 	
+	// 根据版本读取 LastAccessedAt
+	if prefix == 0x02 {
+		err = decoder.Decode(&dv.LastAccessedAt)
+		if err != nil {
+			FreeDataValue(dv)
+			return nil, err
+		}
+	} else {
+		// v1.0 格式，没有 LastAccessedAt
+		dv.LastAccessedAt = time.Now().UnixMilli()
+	}
+
 	// 再读取 Value - 创建一个空接口来接收
 	// Gob 会自动根据注册的类型信息解码为具体类型
 	var value interface{}

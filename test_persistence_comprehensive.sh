@@ -7,7 +7,7 @@ set -e
 
 REDIS_HOST="127.0.0.1"
 REDIS_PORT="16379"
-SERVER_BIN="./bin/gedis-server"
+SERVER_BIN="./bin/redigo-server"
 LOG_FILE="./logs/persistence_comprehensive_test.log"
 DATA_DIR="./data"
 REPORT_FILE="./docs/PERSISTENCE_TEST_REPORT.md"
@@ -47,7 +47,8 @@ echo ""
 
 # 清理环境
 echo -e "${YELLOW}[Phase 1/7] Cleaning up...${NC}"
-killall gedis-server 2>/dev/null || true
+SERVER_BIN="./bin/redigo-server"
+killall redigo-server 2>/dev/null || true
 sleep 2
 rm -rf ${DATA_DIR}/db_*
 rm -f /tmp/lsm_*.txt
@@ -109,7 +110,7 @@ echo ""
 echo -e "${YELLOW}[Phase 4/7] Checking SSTable files...${NC}"
 
 # 停止服务器以检查文件
-killall gedis-server
+killall redigo-server
 sleep 3
 
 # 检查 SSTable 目录
@@ -185,7 +186,7 @@ echo ""
 
 # 最终清理
 echo -e "${YELLOW}[Phase 7/7] Final cleanup...${NC}"
-killall gedis-server
+killall redigo-server
 sleep 2
 echo "✅ Test environment cleaned"
 echo ""

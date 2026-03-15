@@ -28,7 +28,7 @@ func main() {
 	}
 	defer conn.Close()
 	
-	fmt.Println("Gedis 客户端")
+	fmt.Println("RediGo 客户端")
 	fmt.Printf("已连接到 %s\n", addr)
 	fmt.Println("输入命令开始交互，输入 'exit' 退出")
 	fmt.Println()
@@ -36,7 +36,7 @@ func main() {
 	reader := bufio.NewReader(os.Stdin)
 	
 	for {
-		fmt.Print("gedis> ")
+		fmt.Print("redigo> ")
 		
 		input, err := reader.ReadString('\n')
 		if err != nil {
