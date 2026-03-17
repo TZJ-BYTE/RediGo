@@ -11,7 +11,8 @@ RediGo 是一个使用 Go 语言实现的高性能、Redis 协议兼容的键值
 - ✅ **高性能网络层** - 支持标准库 net 和 **gnet (Reactor 模式)** 双引擎切换
 - ✅ **双模式运行** - 内存模式 / LSM Tree 持久化模式
 - ✅ **极致并发** - **分段锁 (Sharded Locks)** 设计，显著减少锁竞争
-- ✅ **零 GC 压力** - 大量使用 **sync.Pool 对象池**，优化内存分配
+- ✅ **低分配协议链路** - RESP 解析 `args` 走 `[][]byte`，控制拷贝时机
+- ✅ **热点快路径** - GET/SET/INCR 绕过通用分发与通用编码，降低延迟与分配
 - ✅ **高性能存储** - LevelDB/RocksDB 风格的 LSM Tree 引擎
 - ✅ **并发安全** - 完整的读写锁机制
 - ✅ **数据过期** - 支持 TTL/PTTL 精确过期控制
@@ -98,6 +99,7 @@ RediGo/
 ├── cmd/                      # 命令行入口
 │   ├── server/              # 服务器入口
 │   └── client/              # 客户端入口
+│   └── bench/               # 基准工具入口
 │
 ├── config/                   # 配置管理
 │   └── config.go            # 配置定义和加载
@@ -129,7 +131,8 @@ RediGo/
 │   │   └── parser.go        # RESP 协议解析器
 │   │
 │   └── server/              # 服务器实现
-│       └── server.go        # TCP 服务器
+│       ├── server_std.go    # 标准库 net 服务器
+│       └── server_gnet.go   # gnet 服务器
 │
 ├── pkg/                      # 公共工具包
 │   ├── logger/              # 日志包
@@ -237,6 +240,14 @@ RediGo/
 
 详见：[`internal/persistence/README.md`](internal/persistence/README.md)
 
+### 智能冷热分层（现状与演进）
+
+- **文件热度（已实现）**：以 SSTable 文件为粒度统计读热度，在 Compaction 选择输入时优先合并冷文件、在容量压力可控时延迟合并热文件，降低热数据被频繁重写带来的写放大与抖动。
+- **Block 热度 + SLRU/Pinning（已实现）**：Block Cache 采用 SLRU（probation/protected）并对高命中 block 做 pinning 倾向；缓存为引擎级共享，减少跨表碎片与重复缓存。
+- **L0 细粒度策略（已实现）**：L0 compaction 输入不再全量选择，改为基于 key-range 重叠的最小集合并迭代扩展，减少不必要的“全量搬运”与抖动。
+- **Key 热度 Top-K（已实现基础统计）**：对读命中的 key 做 Top-K（heavy hitters）统计，当前用于可观测性与后续策略扩展。
+- **调度与背压（已实现基础版）**：后台任务采用预算调度并联动写入压力与缓存命中率；写入繁忙/缓存命中偏低时会延后 compaction/offload，L0 风险升高时优先 compaction，避免 CPU/IO 突刺影响前台延迟。
+
 ***
 
 ## 📊 性能指标
@@ -260,8 +271,84 @@ RediGo/
 ### 内存效率
 
 - MemTable 大小：4MB（可配置）
-- Block Cache：100MB（可配置）
+- Block Cache：100MB（可配置，默认启用；引擎级共享 SLRU）
 - Bloom Filter：10 bits/key（可配置）
+
+***
+
+## ☁️ 存算分离 (MinIO/S3)
+
+RediGo 支持将冷数据自动卸载到 MinIO 或兼容 S3 的对象存储，实现“容量按需扩展、计算与存储解耦”。
+
+### 意义
+
+- **容量解耦**：SSTable 可以落在对象存储，避免本地磁盘成为容量瓶颈；扩容从“加盘”变为“扩 bucket”。
+- **成本优化**：热数据留在本地 SSD，冷数据放对象存储；在大数据量场景下，单位成本通常更低。
+- **弹性与运维**：计算节点可水平扩展/缩容；数据不必跟着计算节点一起迁移，适配云原生/短生命周期实例。
+- **容灾与持久性**：对象存储天然提供较高的持久性与跨区域能力（取决于你的对象存储配置）。
+
+### 当前实现范围
+
+- **文件级别卸载**：以 SSTable 文件为单位上传/下载（不是 Block 级别按需拉取）。
+- **回源读取**：本地缺失 SSTable 时，会自动从对象存储下载回本地再打开继续读。
+- **触发时机**：flush/compaction 产出的 SSTable 会按策略尝试卸载。
+
+### 权衡
+
+- **延迟**：命中本地 SSD 依然快；但回源下载会显著增加尾延迟，适合“冷数据低频访问”的场景。
+- **一致性与可观测性**：对象存储读写失败、网络抖动需要额外监控与重试策略（基础版已支持失败返回）。
+- **带宽/费用**：跨网/跨地域访问会引入带宽占用与可能的出网费用。
+
+### 1. 启动 MinIO
+
+使用 Docker 快速启动 MinIO：
+
+```bash
+docker run -p 9000:9000 -p 9001:9001 \
+  -e "MINIO_ROOT_USER=<access_key>" \
+  -e "MINIO_ROOT_PASSWORD=<secret_key>" \
+  minio/minio server /data --console-address ":9001"
+```
+
+### 2. 配置 RediGo
+
+存算分离默认关闭（`OffloadEnabled=false`）。需要时可在 `config/config.go` 或通过环境变量（`REDIGO_OFFLOAD_*`）显式启用卸载：
+
+```go
+// config.go (DefaultConfig)
+OffloadEnabled:   true,
+OffloadBackend:   "minio",
+OffloadEndpoint:  "127.0.0.1:9000",
+OffloadAccessKey: "<access_key>",
+OffloadSecretKey: "<secret_key>",
+OffloadBucket:    "redigo-data",
+OffloadRegion:    "us-east-1",
+OffloadBasePrefix: "redigo/",
+```
+
+等价的环境变量写法：
+
+```bash
+export REDIGO_OFFLOAD_ENABLED=true
+export REDIGO_OFFLOAD_BACKEND=minio
+export REDIGO_OFFLOAD_ENDPOINT=127.0.0.1:9000
+export REDIGO_OFFLOAD_ACCESS_KEY=<access_key>
+export REDIGO_OFFLOAD_SECRET_KEY=<secret_key>
+export REDIGO_OFFLOAD_BUCKET=redigo-data
+export REDIGO_OFFLOAD_REGION=us-east-1
+export REDIGO_OFFLOAD_BASE_PREFIX=redigo/
+```
+
+### 3. 验证
+
+启动 RediGo 后，SSTable 文件会被上传到 MinIO 的 Bucket 中；当本地 SSTable 文件缺失时，读取会自动从对象存储回源下载后继续读。
+
+也可以直接跑测试验证：
+
+```bash
+go test ./internal/persistence -run TestOffloading_FSBackend_ReadBack -v
+go test ./internal/persistence -run TestOffloading_MinIOBackend_ReadBack -v
+```
 
 ***
 
@@ -270,8 +357,16 @@ RediGo/
 ### 运行单元测试
 
 ```bash
-go test ./... -v
+go test -count=1 ./...
 ```
+
+### 运行竞态检测（推荐）
+
+```bash
+go test -race -count=1 ./...
+```
+
+在 Windows 上 `-race` 需要启用 CGO 并确保 `gcc` 可用（例如 MSYS2 UCRT64 的 `C:\msys64\ucrt64\bin` 在 PATH 中）。
 
 ### 运行特定包测试
 
@@ -298,7 +393,7 @@ go test ./internal/persistence -bench=. -benchmem
 ```go
 type MyCommand struct{}
 
-func (c *MyCommand) Execute(db *database.Database, args []string) *protocol.Response {
+func (c *MyCommand) Execute(db *database.Database, args [][]byte) *protocol.Response {
     // 实现逻辑
     return protocol.MakeSimpleString("OK")
 }
@@ -382,13 +477,17 @@ netstat -an | grep 16379
 
 ### v1.1 (进行中)
 
-- [ ] 智能冷热分层 (Hot/Cold Tiering)
+- ✅ 智能冷热分层 (Hot/Cold Tiering)
 - ✅ Key-Value 分离 (WiscKey / vLog)
-- [ ] 存算分离 (S3/MinIO Offloading)
+- ✅ 存算分离 (S3/MinIO Offloading)
 
 ### v2.0 (未来)
 
 - [ ] Serverless 架构支持
+- [ ] 更智能冷热分层：Key 热度统计与策略
+- [ ] 更智能冷热分层：Block 热度与 Cache Pinning/分区缓存
+- [ ] 更智能冷热分层：L0 细粒度 Compaction（按重叠范围切分）
+- [ ] 更智能冷热分层：后台调度与背压（Compaction/Offload 联动）
 - [ ] 分布式事务
 - [ ] 监控 Dashboard
 

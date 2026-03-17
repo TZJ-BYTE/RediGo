@@ -57,10 +57,10 @@ func (r *ValueLogReader) Read(vp *ValuePointer) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	keyLen := binary.BigEndian.Uint32(header[0:4])
 	valLen := binary.BigEndian.Uint32(header[4:8])
-	
+
 	// 校验长度是否匹配
 	// 格式: [KeyLen(4)][ValueLen(4)][Key][Value][Checksum(4)]
 	expectedLen := 8 + keyLen + valLen + 4
@@ -79,10 +79,10 @@ func (r *ValueLogReader) Read(vp *ValuePointer) ([]byte, error) {
 			}
 			return value, nil
 		}
-		
+
 		return nil, fmt.Errorf("value pointer length mismatch: expected %d, got %d", expectedLen, vp.Len)
 	}
-	
+
 	// 2. 读取完整 Entry 进行校验
 	// 注意：为了性能，我们可以只读 Value，但这会失去 Checksum 的意义。
 	// 这里我们读取整个 Entry 来校验。
@@ -91,14 +91,14 @@ func (r *ValueLogReader) Read(vp *ValuePointer) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	storedChecksum := binary.BigEndian.Uint32(entryData[expectedLen-4:])
 	calculatedChecksum := crc32.ChecksumIEEE(entryData[:expectedLen-4])
-	
+
 	if storedChecksum != calculatedChecksum {
 		return nil, fmt.Errorf("checksum mismatch: expected %x, got %x", storedChecksum, calculatedChecksum)
 	}
-	
+
 	// 3. 提取 Value
 	// Value 位于 Offset + 8 + KeyLen 处
 	// 在 entryData 中的偏移也是 8 + KeyLen

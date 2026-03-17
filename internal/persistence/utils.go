@@ -131,23 +131,23 @@ func EncodeInternalKey(key string, seqNum uint64, suffix InternalKeySuffix) []by
 	// 格式：[key_len:varint][key:key_len bytes][seq_num:8][suffix:1]
 	keyBytes := []byte(key)
 	buf := make([]byte, 0, len(keyBytes)+16)
-	
+
 	// 写入 key 长度
 	lenBuf := make([]byte, 8)
 	n := PutVarint(lenBuf, len(keyBytes))
 	buf = append(buf, lenBuf[:n]...)
-	
+
 	// 写入 key
 	buf = append(buf, keyBytes...)
-	
+
 	// 写入序列号
 	seqBuf := make([]byte, 8)
 	PutUint64(seqBuf, seqNum)
 	buf = append(buf, seqBuf...)
-	
+
 	// 写入类型
 	buf = append(buf, byte(suffix))
-	
+
 	return buf
 }
 
@@ -156,23 +156,23 @@ func DecodeInternalKey(data []byte) (key string, seqNum uint64, suffix InternalK
 	if len(data) == 0 {
 		return "", 0, 0, 0
 	}
-	
+
 	// 读取 key 长度
 	keyLen, n := GetVarint(data)
 	consumed = n
-	
+
 	// 读取 key
 	key = string(data[consumed : consumed+keyLen])
 	consumed += keyLen
-	
+
 	// 读取序列号
 	seqNum = GetUint64(data[consumed:])
 	consumed += 8
-	
+
 	// 读取类型
 	suffix = InternalKeySuffix(data[consumed])
 	consumed++
-	
+
 	return
 }
 
@@ -181,7 +181,7 @@ func DecodeInternalKey(data []byte) (key string, seqNum uint64, suffix InternalK
 func CompareKeys(a, b []byte) int {
 	keyA, _, _, _ := DecodeInternalKey(a)
 	keyB, _, _, _ := DecodeInternalKey(b)
-	
+
 	if keyA < keyB {
 		return -1
 	} else if keyA > keyB {

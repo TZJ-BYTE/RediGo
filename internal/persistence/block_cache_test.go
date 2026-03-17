@@ -179,7 +179,7 @@ func TestBlockCache_HitRate(t *testing.T) {
 
 	hits, misses, _, hitRate := cache.Stats()
 
-	t.Logf("Hits: %d, Misses: %d, Hit Rate: %.2f%%", 
+	t.Logf("Hits: %d, Misses: %d, Hit Rate: %.2f%%",
 		hits, misses, hitRate*100)
 
 	if hits != 2 {
@@ -274,5 +274,25 @@ func BenchmarkBlockCache_Get(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		cache.Get(key)
+	}
+}
+
+func TestBlockCache_SLRUPreferEvictProbation(t *testing.T) {
+	cache := NewBlockCacheWithPolicy(2, 0.5, 1000)
+
+	cache.Put(1, []byte("a"), 1)
+	cache.Put(2, []byte("b"), 1)
+
+	if _, ok := cache.Get(1); !ok {
+		t.Fatal("Expected key 1 to be in cache")
+	}
+
+	cache.Put(3, []byte("c"), 1)
+
+	if _, ok := cache.Get(1); !ok {
+		t.Fatal("Expected key 1 to still be in cache")
+	}
+	if _, ok := cache.Get(2); ok {
+		t.Fatal("Expected key 2 to be evicted")
 	}
 }

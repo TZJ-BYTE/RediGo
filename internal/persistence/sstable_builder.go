@@ -7,18 +7,19 @@ import (
 
 // SSTableBuilder SSTable 构建器
 type SSTableBuilder struct {
-	file         *os.File        // 文件句柄
-	filename     string          // 文件名
-	options      *Options        // 配置选项
-	blockBuilder *BlockBuilder   // Data Block Builder
-	dataBlocks   []BlockHandle   // 数据 Block 句柄
-	indexBlock   *BlockBuilder   // Index Block Builder
-	firstKey     []byte          // 当前 Block 的第一个 key
-	lastKey      []byte          // 上一个 key（用于判断是否需要添加到 Index）
-	entryCount   int             // 条目计数
-	fileSize     int64           // 当前文件大小
-	closed       bool            // 是否已关闭
-	bloomFilter  *BloomFilter    // Bloom Filter
+	file         *os.File      // 文件句柄
+	filename     string        // 文件名
+	options      *Options      // 配置选项
+	blockBuilder *BlockBuilder // Data Block Builder
+	dataBlocks   []BlockHandle // 数据 Block 句柄
+	indexBlock   *BlockBuilder // Index Block Builder
+	firstKey     []byte        // 当前 Block 的第一个 key
+	lastKey      []byte        // 上一个 key（用于判断是否需要添加到 Index）
+	entryCount   int           // 条目计数
+	fileSize     int64         // 当前文件大小
+	closed       bool          // 是否已关闭
+	finished     bool
+	bloomFilter  *BloomFilter // Bloom Filter
 }
 
 // NewSSTableBuilder 创建新的 SSTable Builder
@@ -48,6 +49,7 @@ func NewSSTableBuilder(filename string, options *Options) (*SSTableBuilder, erro
 		entryCount:   0,
 		fileSize:     0,
 		closed:       false,
+		finished:     false,
 		bloomFilter:  bloomFilter,
 	}, nil
 }
@@ -143,7 +145,7 @@ func (b *SSTableBuilder) Finish() error {
 	// 完成 Index Block
 	if !b.indexBlock.Empty() {
 		indexData := b.indexBlock.Finish()
-		
+
 		// 写入 Index Block
 		indexOffset := uint64(b.fileSize)
 		_, err := b.file.Write(indexData)
@@ -151,12 +153,12 @@ func (b *SSTableBuilder) Finish() error {
 			return err
 		}
 		b.fileSize += int64(len(indexData)) // 更新 fileSize
-		
+
 		indexHandle := BlockHandle{
 			offset: indexOffset,
 			size:   uint64(len(indexData)),
 		}
-		
+
 		// 写入 Meta Block（包含 Bloom Filter）
 		metaData := b.bloomFilter.Encode()
 		metaOffset := uint64(b.fileSize) // 使用更新后的 fileSize
@@ -165,12 +167,12 @@ func (b *SSTableBuilder) Finish() error {
 			return err
 		}
 		b.fileSize += int64(len(metaData)) // 更新 fileSize
-		
+
 		metaHandle := BlockHandle{
 			offset: metaOffset,
 			size:   uint64(len(metaData)),
 		}
-		
+
 		// 写入 Footer
 		err = b.writeFooter(metaHandle, indexHandle)
 		if err != nil {
@@ -195,7 +197,7 @@ func (b *SSTableBuilder) Finish() error {
 			offset: uint64(b.fileSize),
 			size:   0,
 		}
-		
+
 		b.fileSize += 0 // Meta Block 为空
 
 		err = b.writeFooter(metaHandle, indexHandle)
@@ -236,6 +238,14 @@ func (b *SSTableBuilder) writeFooter(metaHandle, indexHandle BlockHandle) error 
 		return err
 	}
 
+	b.finished = true
+	b.closed = true
+	if b.file != nil {
+		if err := b.file.Sync(); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -244,6 +254,9 @@ func (b *SSTableBuilder) Abort() {
 	b.closed = true
 	if b.file != nil {
 		b.file.Close()
+		b.file = nil
+	}
+	if !b.finished {
 		os.Remove(b.filename)
 	}
 }

@@ -16,14 +16,14 @@ func TestSetAndGet(t *testing.T) {
 
 	// 测试 SET
 	setCmd := &command.SetCommand{}
-	resp := setCmd.Execute(db, []string{"name", "Alice"})
+	resp := setCmd.Execute(db, [][]byte{[]byte("name"), []byte("Alice")})
 	if resp.Type != '+' {
 		t.Errorf("SET 命令返回错误类型：%v", resp.Type)
 	}
 	
 	// 测试 GET
 	getCmd := &command.GetCommand{}
-	resp = getCmd.Execute(db, []string{"name"})
+	resp = getCmd.Execute(db, [][]byte{[]byte("name")})
 	if resp.Type != '$' {
 		t.Errorf("GET 命令返回错误类型：%v", resp.Type)
 	}
@@ -45,7 +45,7 @@ func TestDel(t *testing.T) {
 	
 	// 测试 DEL
 	delCmd := &command.DelCommand{}
-	resp := delCmd.Execute(db, []string{"testkey"})
+	resp := delCmd.Execute(db, [][]byte{[]byte("testkey")})
 	if resp.Type != ':' {
 		t.Errorf("DEL 命令返回错误类型：%v", resp.Type)
 	}
@@ -67,7 +67,7 @@ func TestExists(t *testing.T) {
 	
 	// 测试 EXISTS
 	existsCmd := &command.ExistsCommand{}
-	resp := existsCmd.Execute(db, []string{"existkey"})
+	resp := existsCmd.Execute(db, [][]byte{[]byte("existkey")})
 	if resp.Type != ':' {
 		t.Errorf("EXISTS 命令返回错误类型：%v", resp.Type)
 	}
@@ -83,7 +83,7 @@ func TestLPushAndLPop(t *testing.T) {
 
 	// 测试 LPUSH
 	lpushCmd := &command.LPushCommand{}
-	resp := lpushCmd.Execute(db, []string{"mylist", "a", "b", "c"})
+	resp := lpushCmd.Execute(db, [][]byte{[]byte("mylist"), []byte("a"), []byte("b"), []byte("c")})
 	if resp.Type != ':' {
 		t.Errorf("LPUSH 命令返回错误类型：%v", resp.Type)
 	}
@@ -93,7 +93,7 @@ func TestLPushAndLPop(t *testing.T) {
 	
 	// 测试 LPOP
 	lpopCmd := &command.LPopCommand{}
-	resp = lpopCmd.Execute(db, []string{"mylist"})
+	resp = lpopCmd.Execute(db, [][]byte{[]byte("mylist")})
 	if resp.Type != '$' {
 		t.Errorf("LPOP 命令返回错误类型：%v", resp.Type)
 	}

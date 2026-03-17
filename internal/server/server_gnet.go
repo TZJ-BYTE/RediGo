@@ -79,13 +79,16 @@ func (s *GnetServer) OnTraffic(c gnet.Conn) gnet.Action {
 
 	offset := 0
 	connCtx := c.Context().(*ConnectionContext)
+	connCtx.writeBuf = connCtx.writeBuf[:0]
 
 	for {
-		req, n, err := protocol.ParseOneRequest(data[offset:])
+		req, n, err := protocol.ParseOneRequestFast(data[offset:])
 		if err != nil {
 			logger.Error("Parser error: %v", err)
 			resp := protocol.MakeError(err)
-			c.Write(protocol.EncodeResponse(resp))
+			connCtx.writeBuf = protocol.AppendResponse(connCtx.writeBuf, resp)
+			protocol.ReleaseResponse(resp)
+			c.Write(connCtx.writeBuf)
 			return gnet.Close
 		}
 
@@ -98,10 +101,15 @@ func (s *GnetServer) OnTraffic(c gnet.Conn) gnet.Action {
 		if req.Cmd == "SELECT" {
 			s.handleSelectCommand(c, connCtx, req.Args)
 		} else {
-			// 执行命令
-			resp := s.registry.Execute(connCtx.DB, req.Cmd, req.Args)
-			c.Write(protocol.EncodeResponse(resp))
+			if out, ok := fastPathExecute(connCtx.writeBuf, connCtx.DB, req.Cmd, req.Args); ok {
+				connCtx.writeBuf = out
+			} else {
+				resp := s.registry.Execute(connCtx.DB, req.Cmd, req.Args)
+				connCtx.writeBuf = protocol.AppendResponse(connCtx.writeBuf, resp)
+				protocol.ReleaseResponse(resp)
+			}
 		}
+		protocol.ReleaseRequest(req)
 
 		offset += n
 
@@ -112,20 +120,29 @@ func (s *GnetServer) OnTraffic(c gnet.Conn) gnet.Action {
 
 	// 丢弃已处理的数据
 	c.Discard(offset)
+	if len(connCtx.writeBuf) > 0 {
+		c.Write(connCtx.writeBuf)
+	}
 
 	return gnet.None
 }
 
 // handleSelectCommand 处理 SELECT 命令
-func (s *GnetServer) handleSelectCommand(c gnet.Conn, ctx *ConnectionContext, args []string) {
+func (s *GnetServer) handleSelectCommand(c gnet.Conn, ctx *ConnectionContext, args [][]byte) {
 	if len(args) != 1 {
 		resp := protocol.MakeError(fmt.Errorf("ERR wrong number of arguments for 'select' command"))
-		c.Write(protocol.EncodeResponse(resp))
+		ctx.writeBuf = protocol.AppendResponse(ctx.writeBuf, resp)
+		protocol.ReleaseResponse(resp)
 		return
 	}
 
-	index := 0
-	fmt.Sscanf(args[0], "%d", &index)
+	index, err := protocol.ParseInt(args[0])
+	if err != nil {
+		resp := protocol.MakeError(fmt.Errorf("ERR invalid DB index"))
+		ctx.writeBuf = protocol.AppendResponse(ctx.writeBuf, resp)
+		protocol.ReleaseResponse(resp)
+		return
+	}
 
 	// 使用 GetDBByIndex 验证索引有效性，但不改变全局 currentDB
 	db, err := s.dbManager.GetDBByIndex(index)
@@ -134,9 +151,11 @@ func (s *GnetServer) handleSelectCommand(c gnet.Conn, ctx *ConnectionContext, ar
 		ctx.DB = db
 
 		resp := protocol.MakeSimpleString("OK")
-		c.Write(protocol.EncodeResponse(resp))
+		ctx.writeBuf = protocol.AppendResponse(ctx.writeBuf, resp)
+		protocol.ReleaseResponse(resp)
 	} else {
 		resp := protocol.MakeError(fmt.Errorf("ERR DB index is out of range"))
-		c.Write(protocol.EncodeResponse(resp))
+		ctx.writeBuf = protocol.AppendResponse(ctx.writeBuf, resp)
+		protocol.ReleaseResponse(resp)
 	}
 }

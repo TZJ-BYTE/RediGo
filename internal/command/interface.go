@@ -7,8 +7,8 @@ import (
 
 // Command 命令接口
 type Command interface {
-	Execute(db *database.Database, args []string) *protocol.Response
+	Execute(db *database.Database, args [][]byte) *protocol.Response
 }
 
 // CommandFunc 命令函数类型
-type CommandFunc func(db *database.Database, args []string) *protocol.Response
+type CommandFunc func(db *database.Database, args [][]byte) *protocol.Response

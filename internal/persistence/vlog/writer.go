@@ -70,7 +70,7 @@ func NewValueLogWriter(dirPath string, maxFileSize int64) (*ValueLogWriter, erro
 // openActiveFile 打开当前活跃文件，如果已满则创建新文件
 func (w *ValueLogWriter) openActiveFile() error {
 	filename := fmt.Sprintf("%s/%06d.vlog", w.dirPath, w.activeFid)
-	
+
 	// 检查当前文件是否存在且是否已满
 	info, err := os.Stat(filename)
 	if err == nil {
@@ -96,7 +96,7 @@ func (w *ValueLogWriter) openActiveFile() error {
 	} else {
 		return err
 	}
-	
+
 	return nil
 }
 
@@ -121,7 +121,7 @@ func (w *ValueLogWriter) Write(key, value []byte) (*ValuePointer, error) {
 	binary.BigEndian.PutUint32(buf[4:8], uint32(len(value)))
 	copy(buf[8:], key)
 	copy(buf[8+len(key):], value)
-	
+
 	// 计算并写入 Checksum
 	// Checksum 覆盖 [KeyLen, ValueLen, Key, Value]
 	checksum := crc32.ChecksumIEEE(buf[:entrySize-4])
@@ -163,7 +163,7 @@ func (w *ValueLogWriter) rotateFile() error {
 func (w *ValueLogWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	if w.activeFile != nil {
 		w.activeFile.Sync()
 		return w.activeFile.Close()

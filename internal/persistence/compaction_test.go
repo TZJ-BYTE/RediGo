@@ -12,18 +12,18 @@ import (
 func TestCompactor_CheckNeedCompaction(t *testing.T) {
 	tmpDir := "/tmp/test_compact_need"
 	defer os.RemoveAll(tmpDir)
-	
+
 	// 创建版本集合
 	vs, err := OpenVersionSet(tmpDir, MaxLevels)
 	if err != nil {
 		t.Fatalf("Failed to open version set: %v", err)
 	}
 	defer vs.Close()
-	
+
 	// 创建 Compactor
 	options := DefaultOptions()
-	compactor := NewCompactor(tmpDir, vs, options)
-	
+	compactor := NewCompactor(tmpDir, vs, options, nil, nil)
+
 	// 在 Level 0 添加多个文件
 	for i := 0; i < Level0FileThreshold+1; i++ {
 		fm := &FileMetadata{
@@ -38,7 +38,7 @@ func TestCompactor_CheckNeedCompaction(t *testing.T) {
 			t.Fatalf("Failed to log add file: %v", err)
 		}
 	}
-	
+
 	// 检查是否需要 Compaction
 	need, level := compactor.checkNeedCompaction()
 	if !need {
@@ -46,6 +46,72 @@ func TestCompactor_CheckNeedCompaction(t *testing.T) {
 	}
 	if level != 0 {
 		t.Errorf("Expected level 0, got %d", level)
+	}
+}
+
+func TestCompactor_SelectInputFiles_HotColdTiering(t *testing.T) {
+	options := DefaultOptions()
+	options.EnableHotColdTiering = true
+	options.HotColdMinFileReads = 10
+	options.HotColdMaxLevelSizeOverFactor = 1.5
+
+	compactor := &Compactor{
+		options: options,
+		fileHeat: func(fileNum uint64) uint64 {
+			if fileNum == 1 {
+				return 100
+			}
+			return 0
+		},
+	}
+
+	version := NewVersion(MaxLevels)
+	version.Files[1] = []*FileMetadata{
+		{FileNum: 1, Size: 100, SmallestKey: []byte("a"), LargestKey: []byte("z"), Level: 1},
+		{FileNum: 2, Size: 100, SmallestKey: []byte("a"), LargestKey: []byte("z"), Level: 1},
+	}
+
+	input := compactor.selectInputFiles(version, 1)
+	if len(input) != 1 {
+		t.Fatalf("expected 1 input file, got %d", len(input))
+	}
+	if input[0].FileNum != 2 {
+		t.Fatalf("expected cold file selected, got %d", input[0].FileNum)
+	}
+}
+
+func TestCompactor_SelectInputFiles_L0FineGrained(t *testing.T) {
+	compactor := &Compactor{options: DefaultOptions()}
+
+	version := NewVersion(MaxLevels)
+	version.Files[0] = []*FileMetadata{
+		{FileNum: 2, Size: 100, SmallestKey: []byte("b"), LargestKey: []byte("d"), Level: 0},
+		{FileNum: 1, Size: 100, SmallestKey: []byte("a"), LargestKey: []byte("c"), Level: 0},
+		{FileNum: 3, Size: 100, SmallestKey: []byte("e"), LargestKey: []byte("f"), Level: 0},
+	}
+
+	input := compactor.selectInputFiles(version, 0)
+	if len(input) != 2 {
+		t.Fatalf("expected 2 input files, got %d", len(input))
+	}
+	if input[0].FileNum != 1 || input[1].FileNum != 2 {
+		t.Fatalf("expected [1,2], got [%d,%d]", input[0].FileNum, input[1].FileNum)
+	}
+}
+
+func TestCompactor_SelectInputFiles_L0FineGrained_ChainExpand(t *testing.T) {
+	compactor := &Compactor{options: DefaultOptions()}
+
+	version := NewVersion(MaxLevels)
+	version.Files[0] = []*FileMetadata{
+		{FileNum: 1, Size: 100, SmallestKey: []byte("a"), LargestKey: []byte("b"), Level: 0},
+		{FileNum: 2, Size: 100, SmallestKey: []byte("b"), LargestKey: []byte("c"), Level: 0},
+		{FileNum: 3, Size: 100, SmallestKey: []byte("c"), LargestKey: []byte("d"), Level: 0},
+	}
+
+	input := compactor.selectInputFiles(version, 0)
+	if len(input) != 3 {
+		t.Fatalf("expected 3 input files, got %d", len(input))
 	}
 }
 
@@ -57,34 +123,34 @@ func TestMergeIterator_Basic(t *testing.T) {
 	iter2 := &mockIterator{
 		data: []kv{{[]byte("b"), []byte("2")}, {[]byte("d"), []byte("4")}},
 	}
-	
+
 	// 创建归并迭代器
 	mi := newMergeIterator([]Iterator{iter1, iter2})
 	defer mi.Release()
-	
+
 	// 验证顺序
 	expectedKeys := [][]byte{[]byte("a"), []byte("b"), []byte("c"), []byte("d")}
 	expectedValues := [][]byte{[]byte("1"), []byte("2"), []byte("3"), []byte("4")}
-	
+
 	i := 0
 	for mi.First(); mi.Valid(); mi.Next() {
 		if i >= len(expectedKeys) {
 			t.Fatal("Too many keys")
 		}
-		
+
 		key := mi.Key()
 		value := mi.Value()
-		
+
 		if string(key) != string(expectedKeys[i]) {
 			t.Errorf("Expected key %s, got %s", expectedKeys[i], key)
 		}
 		if string(value) != string(expectedValues[i]) {
 			t.Errorf("Expected value %s, got %s", expectedValues[i], value)
 		}
-		
+
 		i++
 	}
-	
+
 	if i != 4 {
 		t.Errorf("Expected 4 keys, got %d", i)
 	}
@@ -93,7 +159,7 @@ func TestMergeIterator_Basic(t *testing.T) {
 func TestCompaction_Integration(t *testing.T) {
 	tmpDir := "/tmp/test_compact_integration"
 	defer os.RemoveAll(tmpDir)
-	
+
 	// 创建 LSM Engine
 	options := DefaultOptions()
 	engine, err := OpenLSMEnergy(tmpDir, options)
@@ -101,7 +167,7 @@ func TestCompaction_Integration(t *testing.T) {
 		t.Fatalf("Failed to open engine: %v", err)
 	}
 	defer engine.Close()
-	
+
 	// 写入足够多的数据以触发 Compaction
 	for i := 0; i < 100; i++ {
 		key := fmt.Sprintf("key%d", i)
@@ -111,15 +177,15 @@ func TestCompaction_Integration(t *testing.T) {
 			t.Fatalf("Failed to put: %v", err)
 		}
 	}
-	
+
 	// 等待一小段时间让后台 Compaction 运行
 	time.Sleep(100 * time.Millisecond)
-	
+
 	// 验证数据仍然可以读取
 	for i := 0; i < 100; i++ {
 		key := fmt.Sprintf("key%d", i)
 		expectedValue := fmt.Sprintf("value%d", i)
-		
+
 		val, found := engine.Get([]byte(key))
 		if !found {
 			t.Errorf("Expected to find key %s", key)
@@ -129,16 +195,16 @@ func TestCompaction_Integration(t *testing.T) {
 			t.Errorf("Expected value %s, got %s", expectedValue, val)
 		}
 	}
-	
+
 	// 检查 SSTable 目录
 	sstableDir := filepath.Join(tmpDir, "sstable")
 	files, err := os.ReadDir(sstableDir)
 	if err != nil {
 		t.Fatalf("Failed to read sstable dir: %v", err)
 	}
-	
+
 	t.Logf("Created %d SSTable files", len(files))
-	
+
 	// 验证 Version Set 统计信息
 	stats := engine.versionSet.GetStats()
 	t.Logf("Version stats: %+v", stats)

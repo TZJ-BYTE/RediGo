@@ -3,7 +3,7 @@ package command
 import (
 	"errors"
 	"strings"
-	
+
 	"github.com/TZJ-BYTE/RediGo/internal/database"
 	"github.com/TZJ-BYTE/RediGo/internal/protocol"
 )
@@ -27,17 +27,17 @@ func (r *CommandRegistry) Register(name string, cmd Command) {
 
 // Get 获取命令
 func (r *CommandRegistry) Get(name string) (Command, bool) {
-	cmd, exists := r.commands[strings.ToUpper(name)]
+	cmd, exists := r.commands[name]
 	return cmd, exists
 }
 
 // Execute 执行命令
-func (r *CommandRegistry) Execute(db *database.Database, cmdName string, args []string) *protocol.Response {
+func (r *CommandRegistry) Execute(db *database.Database, cmdName string, args [][]byte) *protocol.Response {
 	cmd, exists := r.Get(cmdName)
 	if !exists {
 		return protocol.MakeError(errors.New("ERR unknown command '" + cmdName + "'"))
 	}
-	
+
 	return cmd.Execute(db, args)
 }
 
@@ -55,26 +55,26 @@ func InitDefaultCommands() {
 	DefaultRegistry.Register("KEYS", &KeysCommand{})
 	DefaultRegistry.Register("FLUSHDB", &FlushDBCommand{})
 	DefaultRegistry.Register("DBSIZE", &DBSizeCommand{})
-	
+
 	// 连接测试命令
 	DefaultRegistry.Register("PING", &PingCommand{})
-	
+
 	// 过期时间命令
 	DefaultRegistry.Register("TTL", &TtlCommand{})
 	DefaultRegistry.Register("PTTL", &PttlCommand{})
-	
+
 	// 原子增减命令
 	DefaultRegistry.Register("INCR", &IncrCommand{})
 	DefaultRegistry.Register("DECR", &DecrCommand{})
-	
+
 	// 批量操作命令
 	DefaultRegistry.Register("MSET", &MsetCommand{})
 	DefaultRegistry.Register("MGET", &MgetCommand{})
-	
+
 	// 重命名命令
 	DefaultRegistry.Register("RENAME", &RenameCommand{})
 	DefaultRegistry.Register("RENAMENX", &RenamenxCommand{})
-	
+
 	// 列表命令
 	DefaultRegistry.Register("LPUSH", &LPushCommand{})
 	DefaultRegistry.Register("RPUSH", &RPushCommand{})
@@ -82,7 +82,7 @@ func InitDefaultCommands() {
 	DefaultRegistry.Register("RPOP", &RPopCommand{})
 	DefaultRegistry.Register("LLEN", &LLenCommand{})
 	DefaultRegistry.Register("LRANGE", &LRangeCommand{})
-	
+
 	// 哈希命令
 	DefaultRegistry.Register("HSET", &HSetCommand{})
 	DefaultRegistry.Register("HGET", &HGetCommand{})

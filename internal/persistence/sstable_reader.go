@@ -8,41 +8,56 @@ import (
 
 // SSTableReader SSTable 读取器
 type SSTableReader struct {
-	file       *os.File        // 文件句柄
-	filename   string          // 文件名
-	options    *Options        // 配置选项
-	footer     *Footer         // Footer 信息
-	indexBlock *Block          // Index Block（常驻内存）
-	dataCache  map[uint64]*Block // Data Block 缓存（简化版）
-	bloomFilter *BloomFilter   // Bloom Filter（可选）
-	blockCache *BlockCache     // Block Cache（LRU）
+	file        *os.File // 文件句柄
+	filename    string   // 文件名
+	fileNum     uint64
+	options     *Options          // 配置选项
+	footer      *Footer           // Footer 信息
+	indexBlock  *Block            // Index Block（常驻内存）
+	dataCache   map[uint64]*Block // Data Block 缓存（简化版）
+	bloomFilter *BloomFilter      // Bloom Filter（可选）
+	blockCache  *BlockCache       // Block Cache（LRU）
 }
 
 // OpenSSTableForRead 打开 SSTable 用于读取
 func OpenSSTableForRead(filename string, options *Options) (*SSTableReader, error) {
+	return OpenSSTableForReadWithCache(0, filename, options, nil)
+}
+
+func OpenSSTableForReadWithCache(fileNum uint64, filename string, options *Options, sharedCache *BlockCache) (*SSTableReader, error) {
 	if options == nil {
 		options = DefaultOptions()
 	}
-	
+
 	file, err := os.OpenFile(filename, os.O_RDONLY, 0644)
 	if err != nil {
 		return nil, err
 	}
-	
+
+	var cache *BlockCache
+	if options.UseCache {
+		if sharedCache != nil {
+			cache = sharedCache
+		} else {
+			cache = NewBlockCache(int64(options.CacheSize))
+		}
+	}
+
 	reader := &SSTableReader{
 		file:       file,
 		filename:   filename,
+		fileNum:    fileNum,
 		options:    options,
 		dataCache:  make(map[uint64]*Block),
-		blockCache: NewBlockCache(int64(options.CacheSize)),
+		blockCache: cache,
 	}
-	
+
 	// 读取 Footer
 	if err := reader.readFooter(); err != nil {
 		file.Close()
 		return nil, err
 	}
-	
+
 	// 预加载 Index Block 到内存
 	if err := reader.loadIndexBlock(); err != nil {
 		file.Close()
@@ -64,7 +79,7 @@ func NewSSTableReader(filename string, file *os.File, options *Options) (*SSTabl
 		filename:   filename,
 		options:    options,
 		dataCache:  make(map[uint64]*Block),
-		blockCache: NewBlockCache(int64(options.CacheSize)),
+		blockCache: nil,
 	}
 
 	return r, nil
@@ -98,12 +113,12 @@ func (r *SSTableReader) readFooter() error {
 
 	// 解析 Footer
 	footer := &Footer{}
-	
+
 	n := 0
-	
+
 	// 解码 meta index handle
 	var offset, size uint64
-	offset, n = binary.Uvarint(footerData[n:n+10])
+	offset, n = binary.Uvarint(footerData[n : n+10])
 	if n <= 0 {
 		return ErrInvalidFormat
 	}
@@ -113,22 +128,22 @@ func (r *SSTableReader) readFooter() error {
 	}
 	footer.metaIndexHandle = BlockHandle{offset: offset, size: size}
 	n += m
-	
+
 	// 解码 index handle
 	offset, m = binary.Uvarint(footerData[n : n+10]) // 使用 m 接收新的偏移
 	if m <= 0 {
 		return ErrInvalidFormat
 	}
 	n += m
-	
+
 	size, m = binary.Uvarint(footerData[n : n+10])
 	if m <= 0 {
 		return ErrInvalidFormat
 	}
 	n += m
-	
+
 	footer.indexHandle = BlockHandle{offset: offset, size: size}
-	
+
 	r.footer = footer
 	return nil
 }
@@ -138,16 +153,16 @@ func (r *SSTableReader) loadIndexBlock() error {
 	if r.footer == nil {
 		return ErrInvalidFormat
 	}
-	
+
 	handle := r.footer.indexHandle
-	
+
 	// 读取 Index Block 数据
 	data := make([]byte, handle.size)
 	_, err := r.file.ReadAt(data, int64(handle.offset))
 	if err != nil {
 		return err
 	}
-	
+
 	r.indexBlock = NewBlock(data)
 	return nil
 }
@@ -200,36 +215,36 @@ func (r *SSTableReader) findDataBlock(key []byte) (BlockHandle, bool) {
 	if r.indexBlock == nil || r.indexBlock.Data() == nil {
 		return BlockHandle{}, false
 	}
-	
+
 	iter := NewBlockIterator(r.indexBlock.Data())
-	
+
 	var targetHandle BlockHandle
 	found := false
-	
+
 	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
 		indexKey := iter.Key()
-		
+
 		// 如果 index key > key，说明前一个 block 是目标
 		if bytes.Compare(indexKey, key) > 0 {
 			break
 		}
-		
+
 		// 解码 BlockHandle
 		handleData := iter.Value()
 		if len(handleData) == 0 {
 			continue
 		}
-		
+
 		var handle BlockHandle
 		_, err := handle.Decode(handleData)
 		if err != nil {
 			continue
 		}
-		
+
 		targetHandle = handle
 		found = true
 	}
-	
+
 	return targetHandle, found
 }
 
@@ -244,18 +259,18 @@ func (r *SSTableReader) getFromBlock(handle BlockHandle, key []byte) ([]byte, bo
 		if err != nil {
 			return nil, false
 		}
-		
+
 		block = NewBlock(data)
-		
+
 		// 简单的缓存策略：总是保留（实际应该用 LRU）
 		if len(r.dataCache) < 100 { // 限制缓存数量
 			r.dataCache[handle.offset] = block
 		}
 	}
-	
+
 	// 在 Block 中查找 key
 	iter := NewBlockIterator(block.Data())
-	
+
 	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
 		if bytes.Equal(iter.Key(), key) {
 			value := make([]byte, len(iter.Value()))
@@ -263,7 +278,7 @@ func (r *SSTableReader) getFromBlock(handle BlockHandle, key []byte) ([]byte, bo
 			return value, true
 		}
 	}
-	
+
 	return nil, false
 }
 
@@ -312,7 +327,7 @@ func (r *SSTableReader) Close() error {
 func (r *SSTableReader) getBlockFromCache(offset uint64) (*Block, bool) {
 	// 先尝试 LRU Cache
 	if r.blockCache != nil {
-		if val, ok := r.blockCache.Get(offset); ok {
+		if val, ok := r.blockCache.Get(r.blockCacheKey(offset)); ok {
 			if block, ok := val.(*Block); ok {
 				return block, true
 			}
@@ -328,13 +343,20 @@ func (r *SSTableReader) getBlockFromCache(offset uint64) (*Block, bool) {
 func (r *SSTableReader) putBlockToCache(offset uint64, block *Block, size int) {
 	// 优先使用 LRU Cache
 	if r.blockCache != nil {
-		r.blockCache.Put(offset, block, size)
+		r.blockCache.Put(r.blockCacheKey(offset), block, size)
 	}
 
 	// 同时保留旧的 dataCache（向后兼容）
 	if len(r.dataCache) < 100 { // 限制缓存数量
 		r.dataCache[offset] = block
 	}
+}
+
+func (r *SSTableReader) blockCacheKey(offset uint64) uint64 {
+	if r.fileNum == 0 {
+		return offset
+	}
+	return (r.fileNum << 32) ^ offset
 }
 
 // SSTableIterator SSTable 迭代器
@@ -357,16 +379,16 @@ func (it *SSTableIterator) First() bool {
 		it.valid = false
 		return false
 	}
-	
+
 	// 初始化 Index Iterator
 	it.indexIter = NewBlockIterator(it.reader.indexBlock.Data())
 	it.indexIter.SeekToFirst()
-	
+
 	if !it.indexIter.Valid() {
 		it.valid = false
 		return false
 	}
-	
+
 	// 加载第一个 Block
 	return it.loadBlockFromIndexAndAdvance()
 }
@@ -377,57 +399,57 @@ func (it *SSTableIterator) Seek(key []byte) bool {
 		it.valid = false
 		return false
 	}
-	
+
 	it.indexIter = NewBlockIterator(it.reader.indexBlock.Data())
-	
+
 	var targetHandle BlockHandle
 	found := false
-	
+
 	// 在 Index Block 中查找目标 Data Block
 	// 我们需要找到最后一个 key <= targetKey 的 block (或者说找到第一个 key > targetKey 的 block 的前一个)
 	// 但由于 Index 中存储的是 Block 的 firstKey，如果 searchKey < firstKey，则该 block 不包含 searchKey
 	// 因此我们找的是最后一个 firstKey <= searchKey 的 block
-	
+
 	for it.indexIter.SeekToFirst(); it.indexIter.Valid(); it.indexIter.Next() {
 		indexKey := it.indexIter.Key()
-		
+
 		// 如果 index key > key，说明前一个 block 是目标
 		// 此时 indexIter 指向的是 *下一个* block，正好符合我们在 Next() 中的预期
 		if bytes.Compare(indexKey, key) > 0 {
 			break
 		}
-		
+
 		// 解码 BlockHandle
 		handleData := it.indexIter.Value()
 		if len(handleData) == 0 {
 			continue
 		}
-		
+
 		var handle BlockHandle
 		_, err := handle.Decode(handleData)
 		if err != nil {
 			continue
 		}
-		
+
 		targetHandle = handle
 		found = true
 	}
-	
+
 	if !found {
 		it.valid = false
 		return false
 	}
-	
+
 	// 加载 Data Block
 	if err := it.loadBlock(targetHandle); err != nil {
 		it.err = err
 		it.valid = false
 		return false
 	}
-	
+
 	// 在 Data Block 中 Seek
 	it.valid = it.current.Seek(key)
-	
+
 	// 如果在当前 Block 中没找到 (到达末尾)，但 Block Iterator 是有效的
 	// 这可能意味着 key 大于该 Block 的所有 key
 	// 在这种情况下，我们应该尝试加载下一个 Block
@@ -443,7 +465,7 @@ func (it *SSTableIterator) Seek(key []byte) bool {
 			it.valid = it.current.Valid()
 		}
 	}
-	
+
 	return it.valid
 }
 
@@ -452,7 +474,7 @@ func (it *SSTableIterator) loadBlockFromIndexAndAdvance() bool {
 	if !it.indexIter.Valid() {
 		return false
 	}
-	
+
 	handleData := it.indexIter.Value()
 	var handle BlockHandle
 	_, err := handle.Decode(handleData)
@@ -461,16 +483,16 @@ func (it *SSTableIterator) loadBlockFromIndexAndAdvance() bool {
 		it.valid = false
 		return false
 	}
-	
+
 	// 移动到下一个 index
 	it.indexIter.Next()
-	
+
 	if err := it.loadBlock(handle); err != nil {
 		it.err = err
 		it.valid = false
 		return false
 	}
-	
+
 	it.current.SeekToFirst()
 	it.valid = it.current.Valid()
 	return it.valid
@@ -489,7 +511,7 @@ func (it *SSTableIterator) loadBlock(handle BlockHandle) error {
 		block = NewBlock(data)
 		it.reader.putBlockToCache(handle.offset, block, len(data))
 	}
-	
+
 	it.current = NewBlockIterator(block.Data())
 	return nil
 }
@@ -520,14 +542,14 @@ func (it *SSTableIterator) Next() bool {
 	if !it.valid || it.current == nil {
 		return false
 	}
-	
+
 	it.current.Next()
-	
+
 	// 如果当前 Block 遍历完了，加载下一个 Block
 	if !it.current.Valid() {
 		return it.loadNextBlock()
 	}
-	
+
 	return it.valid
 }
 
@@ -538,7 +560,7 @@ func (it *SSTableIterator) loadNextBlock() bool {
 		it.valid = false
 		return false
 	}
-	
+
 	return it.loadBlockFromIndexAndAdvance()
 }
 

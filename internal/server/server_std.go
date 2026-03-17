@@ -65,6 +65,12 @@ func (s *StdServer) Start() error {
 			}
 		}
 
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			_ = tcpConn.SetNoDelay(true)
+			_ = tcpConn.SetReadBuffer(1 << 20)
+			_ = tcpConn.SetWriteBuffer(1 << 20)
+		}
+
 		go s.handleConnection(conn)
 	}
 }
@@ -75,8 +81,9 @@ func (s *StdServer) handleConnection(conn net.Conn) {
 
 	logger.Info("新连接：%s", conn.RemoteAddr().String())
 
-	parser := protocol.NewParser(conn)
 	connCtx := NewConnectionContext(s.dbManager.GetDefaultDB())
+	buf := make([]byte, 256*1024)
+	start, end := 0, 0
 
 	for {
 		select {
@@ -85,61 +92,105 @@ func (s *StdServer) handleConnection(conn net.Conn) {
 		default:
 		}
 
-		// 解析请求
-		req, err := parser.ParseRequest()
+		if end == len(buf) {
+			if start > 0 {
+				copy(buf, buf[start:end])
+				end -= start
+				start = 0
+			} else {
+				nb := make([]byte, len(buf)*2)
+				copy(nb, buf)
+				buf = nb
+			}
+		}
+
+		n, err := conn.Read(buf[end:])
 		if err != nil {
 			if err == io.EOF {
 				logger.Info("连接关闭：%s", conn.RemoteAddr().String())
 				return
 			}
-			logger.Error("解析请求错误：%v", err)
-
-			// 发送错误响应
+			logger.Error("读取请求错误：%v", err)
 			resp := protocol.MakeError(err)
-			conn.Write(protocol.EncodeResponse(resp))
+			connCtx.respBuf = protocol.EncodeResponseInto(connCtx.respBuf, resp)
+			protocol.ReleaseResponse(resp)
+			conn.Write(connCtx.respBuf)
+			continue
+		}
+		if n == 0 {
 			continue
 		}
 
-		// 特殊处理 SELECT 命令
-		if req.Cmd == "SELECT" {
-			s.handleSelectCommand(conn, connCtx, req.Args)
-			continue
+		end += n
+		connCtx.writeBuf = connCtx.writeBuf[:0]
+
+		for {
+			req, consumed, perr := protocol.ParseOneRequestFast(buf[start:end])
+			if perr != nil {
+				resp := protocol.MakeError(perr)
+				connCtx.writeBuf = protocol.AppendResponse(connCtx.writeBuf, resp)
+				protocol.ReleaseResponse(resp)
+				conn.Write(connCtx.writeBuf)
+				return
+			}
+			if consumed == 0 {
+				break
+			}
+
+			if req.Cmd == "SELECT" {
+				s.handleSelectCommand(conn, connCtx, req.Args)
+			} else {
+				if out, ok := fastPathExecute(connCtx.writeBuf, connCtx.DB, req.Cmd, req.Args); ok {
+					connCtx.writeBuf = out
+				} else {
+					resp := s.registry.Execute(connCtx.DB, req.Cmd, req.Args)
+					connCtx.writeBuf = protocol.AppendResponse(connCtx.writeBuf, resp)
+					protocol.ReleaseResponse(resp)
+				}
+			}
+			protocol.ReleaseRequest(req)
+			start += consumed
+			if start >= end {
+				start, end = 0, 0
+				break
+			}
 		}
 
-		// 执行命令
-		resp := s.registry.Execute(connCtx.DB, req.Cmd, req.Args)
-
-		// 发送响应
-		conn.Write(protocol.EncodeResponse(resp))
+		if len(connCtx.writeBuf) > 0 {
+			conn.Write(connCtx.writeBuf)
+		}
 	}
 }
 
 // handleSelectCommand 处理 SELECT 命令
-func (s *StdServer) handleSelectCommand(conn net.Conn, ctx *ConnectionContext, args []string) {
+func (s *StdServer) handleSelectCommand(conn net.Conn, ctx *ConnectionContext, args [][]byte) {
 	if len(args) != 1 {
 		resp := protocol.MakeError(fmt.Errorf("ERR wrong number of arguments for 'select' command"))
-		conn.Write(protocol.EncodeResponse(resp))
+		ctx.writeBuf = protocol.AppendResponse(ctx.writeBuf, resp)
+		protocol.ReleaseResponse(resp)
 		return
 	}
 
-	index := 0
-	_, err := fmt.Sscanf(args[0], "%d", &index)
+	index, err := protocol.ParseInt(args[0])
 	if err != nil {
 		resp := protocol.MakeError(fmt.Errorf("ERR invalid DB index"))
-		conn.Write(protocol.EncodeResponse(resp))
+		ctx.writeBuf = protocol.AppendResponse(ctx.writeBuf, resp)
+		protocol.ReleaseResponse(resp)
 		return
 	}
 
 	newDB, err := s.dbManager.GetDBByIndex(index)
 	if err != nil {
 		resp := protocol.MakeError(fmt.Errorf("ERR DB index is out of range"))
-		conn.Write(protocol.EncodeResponse(resp))
+		ctx.writeBuf = protocol.AppendResponse(ctx.writeBuf, resp)
+		protocol.ReleaseResponse(resp)
 		return
 	}
 
 	ctx.DB = newDB
 	resp := protocol.MakeSimpleString("OK")
-	conn.Write(protocol.EncodeResponse(resp))
+	ctx.writeBuf = protocol.AppendResponse(ctx.writeBuf, resp)
+	protocol.ReleaseResponse(resp)
 }
 
 // Stop 停止服务器

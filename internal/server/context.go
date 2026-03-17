@@ -13,6 +13,9 @@ type ConnectionContext struct {
 	// 认证状态（未来支持）
 	Authenticated bool
 
+	respBuf  []byte
+	writeBuf []byte
+
 	// 事务状态（未来支持）
 	// MultiState *MultiState
 }
@@ -22,5 +25,7 @@ func NewConnectionContext(defaultDB *database.Database) *ConnectionContext {
 	return &ConnectionContext{
 		DB:            defaultDB,
 		Authenticated: false,
+		respBuf:       make([]byte, 0, 512),
+		writeBuf:      make([]byte, 0, 4096),
 	}
 }

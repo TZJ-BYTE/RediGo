@@ -5,35 +5,56 @@ import (
 	"sync"
 )
 
-// CacheItem 缓存项
 type CacheItem struct {
-	key   uint64      // Block offset 作为 key
-	value interface{} // Block 数据
-	size  int         // 数据大小
+	key    uint64
+	value  interface{}
+	size   int
+	seg    uint8
+	hits   uint32
+	pinned bool
 }
 
-// BlockCache LRU Block Cache
 type BlockCache struct {
-	mu        sync.RWMutex
-	cache     map[uint64]*list.Element // offset -> list element
-	lruList   *list.List               // LRU 链表，头部是最最近使用的
-	maxSize   int64                    // 最大缓存大小（字节）
-	curSize   int64                    // 当前缓存大小（字节）
-	hits      int64                    // 命中次数
-	misses    int64                    // 未命中次数
-	evictions int64                    // 淘汰次数
+	mu         sync.RWMutex
+	cache      map[uint64]*list.Element // offset -> list element
+	probation  *list.List
+	protected  *list.List
+	maxSize    int64 // 最大缓存大小（字节）
+	curSize    int64
+	probSize   int64
+	protSize   int64
+	protMax    int64
+	pinMinHits uint32
+	hits       int64 // 命中次数
+	misses     int64 // 未命中次数
+	evictions  int64 // 淘汰次数
 }
 
-// NewBlockCache 创建一个新的 Block Cache
 func NewBlockCache(maxSize int64) *BlockCache {
+	return NewBlockCacheWithPolicy(maxSize, 0.8, 32)
+}
+
+func NewBlockCacheWithPolicy(maxSize int64, protectedRatio float64, pinMinHits uint32) *BlockCache {
+	if protectedRatio <= 0 || protectedRatio >= 1 {
+		protectedRatio = 0.8
+	}
+	if pinMinHits == 0 {
+		pinMinHits = 32
+	}
+	protMax := int64(float64(maxSize) * protectedRatio)
+	if protMax < 0 {
+		protMax = 0
+	}
 	return &BlockCache{
-		cache:   make(map[uint64]*list.Element),
-		lruList: list.New(),
-		maxSize: maxSize,
+		cache:      make(map[uint64]*list.Element),
+		probation:  list.New(),
+		protected:  list.New(),
+		maxSize:    maxSize,
+		protMax:    protMax,
+		pinMinHits: pinMinHits,
 	}
 }
 
-// Get 从缓存中获取数据
 func (c *BlockCache) Get(key uint64) (interface{}, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -44,15 +65,30 @@ func (c *BlockCache) Get(key uint64) (interface{}, bool) {
 		return nil, false
 	}
 
-	// 移动到链表头部（标记为最近使用）
-	c.lruList.MoveToFront(elem)
+	item := elem.Value.(*CacheItem)
+	item.hits++
+
+	if item.seg == 0 {
+		c.probation.Remove(elem)
+		c.probSize -= int64(item.size)
+		item.seg = 1
+		elem = c.protected.PushFront(item)
+		c.cache[key] = elem
+		c.protSize += int64(item.size)
+	} else {
+		c.protected.MoveToFront(elem)
+	}
+
+	if !item.pinned && item.hits >= c.pinMinHits {
+		item.pinned = true
+	}
+
+	c.rebalanceLocked()
 	c.hits++
 
-	item := elem.Value.(*CacheItem)
 	return item.value, true
 }
 
-// Put 将数据放入缓存
 func (c *BlockCache) Put(key uint64, value interface{}, size int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -66,11 +102,22 @@ func (c *BlockCache) Put(key uint64, value interface{}, size int) {
 		item.size = size
 
 		// 更新大小
+		if item.seg == 0 {
+			c.probSize -= int64(oldSize)
+			c.probSize += int64(size)
+			c.probation.MoveToFront(elem)
+		} else {
+			c.protSize -= int64(oldSize)
+			c.protSize += int64(size)
+			c.protected.MoveToFront(elem)
+		}
 		c.curSize -= int64(oldSize)
 		c.curSize += int64(size)
-
-		// 移动到链表头部
-		c.lruList.MoveToFront(elem)
+		item.hits++
+		if !item.pinned && item.hits >= c.pinMinHits {
+			item.pinned = true
+		}
+		c.rebalanceLocked()
 		return
 	}
 
@@ -79,23 +126,24 @@ func (c *BlockCache) Put(key uint64, value interface{}, size int) {
 		return
 	}
 
-	// 如果需要淘汰，释放空间
-	for c.curSize+int64(size) > c.maxSize && c.lruList.Len() > 0 {
-		c.evictOldest()
+	if !c.ensureSpaceLocked(int64(size)) {
+		return
 	}
 
-	// 添加新项到链表头部
 	item := &CacheItem{
 		key:   key,
 		value: value,
 		size:  size,
+		seg:   0,
+		hits:  1,
 	}
-	elem := c.lruList.PushFront(item)
+	elem := c.probation.PushFront(item)
 	c.cache[key] = elem
 	c.curSize += int64(size)
+	c.probSize += int64(size)
+	c.rebalanceLocked()
 }
 
-// Delete 从缓存中删除数据
 func (c *BlockCache) Delete(key uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -106,41 +154,45 @@ func (c *BlockCache) Delete(key uint64) {
 	}
 
 	item := elem.Value.(*CacheItem)
-	c.lruList.Remove(elem)
+	if item.seg == 0 {
+		c.probation.Remove(elem)
+		c.probSize -= int64(item.size)
+	} else {
+		c.protected.Remove(elem)
+		c.protSize -= int64(item.size)
+	}
 	delete(c.cache, key)
 	c.curSize -= int64(item.size)
 }
 
-// Clear 清空缓存
 func (c *BlockCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.cache = make(map[uint64]*list.Element)
-	c.lruList = list.New()
+	c.probation = list.New()
+	c.protected = list.New()
 	c.curSize = 0
+	c.probSize = 0
+	c.protSize = 0
 }
 
-// Size 获取当前缓存大小（字节）
 func (c *BlockCache) Size() int64 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.curSize
 }
 
-// Len 获取缓存项数量
 func (c *BlockCache) Len() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.lruList.Len()
+	return len(c.cache)
 }
 
-// MaxSize 获取最大缓存大小
 func (c *BlockCache) MaxSize() int64 {
 	return c.maxSize
 }
 
-// HitRate 获取命中率
 func (c *BlockCache) HitRate() float64 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -152,7 +204,6 @@ func (c *BlockCache) HitRate() float64 {
 	return float64(c.hits) / float64(total)
 }
 
-// Stats 获取缓存统计信息
 func (c *BlockCache) Stats() (hits, misses, evictions int64, hitRate float64) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -167,41 +218,16 @@ func (c *BlockCache) Stats() (hits, misses, evictions int64, hitRate float64) {
 	return c.hits, c.misses, c.evictions, hitRate
 }
 
-// evictOldest 淘汰最久未使用的项（必须在持有锁的情况下调用）
-func (c *BlockCache) evictOldest() {
-	if c.lruList.Len() == 0 {
-		return
-	}
-
-	// 获取链表尾部元素（最久未使用）
-	elem := c.lruList.Back()
-	if elem == nil {
-		return
-	}
-
-	item := elem.Value.(*CacheItem)
-
-	// 从链表和映射中删除
-	c.lruList.Remove(elem)
-	delete(c.cache, item.key)
-	c.curSize -= int64(item.size)
-	c.evictions++
-}
-
-// Resize 调整缓存大小
 func (c *BlockCache) Resize(newMaxSize int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.maxSize = newMaxSize
+	c.protMax = int64(float64(newMaxSize) * 0.8)
 
-	// 如果新大小小于当前大小，需要淘汰一些项
-	for c.curSize > c.maxSize && c.lruList.Len() > 0 {
-		c.evictOldest()
-	}
+	c.rebalanceLocked()
 }
 
-// Keys 获取所有缓存的 key（用于调试）
 func (c *BlockCache) Keys() []uint64 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -211,4 +237,87 @@ func (c *BlockCache) Keys() []uint64 {
 		keys = append(keys, key)
 	}
 	return keys
+}
+
+func (c *BlockCache) ensureSpaceLocked(need int64) bool {
+	if need > c.maxSize {
+		return false
+	}
+	for c.curSize+need > c.maxSize {
+		if !c.evictOneLocked() {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *BlockCache) rebalanceLocked() {
+	for c.protSize > c.protMax {
+		elem := c.protected.Back()
+		if elem == nil {
+			break
+		}
+		item := elem.Value.(*CacheItem)
+		c.protected.Remove(elem)
+		c.protSize -= int64(item.size)
+		item.seg = 0
+		newElem := c.probation.PushFront(item)
+		c.cache[item.key] = newElem
+		c.probSize += int64(item.size)
+	}
+
+	for c.curSize > c.maxSize {
+		if !c.evictOneLocked() {
+			break
+		}
+	}
+}
+
+func (c *BlockCache) evictOneLocked() bool {
+	if c.probation.Len() > 0 {
+		if c.evictFromListLocked(c.probation, 0) {
+			return true
+		}
+	}
+	if c.protected.Len() > 0 {
+		if c.evictFromListLocked(c.protected, 1) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *BlockCache) evictFromListLocked(l *list.List, seg uint8) bool {
+	for elem := l.Back(); elem != nil; elem = elem.Prev() {
+		item := elem.Value.(*CacheItem)
+		if item.pinned {
+			continue
+		}
+		l.Remove(elem)
+		delete(c.cache, item.key)
+		c.curSize -= int64(item.size)
+		if seg == 0 {
+			c.probSize -= int64(item.size)
+		} else {
+			c.protSize -= int64(item.size)
+		}
+		c.evictions++
+		return true
+	}
+
+	elem := l.Back()
+	if elem == nil {
+		return false
+	}
+	item := elem.Value.(*CacheItem)
+	l.Remove(elem)
+	delete(c.cache, item.key)
+	c.curSize -= int64(item.size)
+	if seg == 0 {
+		c.probSize -= int64(item.size)
+	} else {
+		c.protSize -= int64(item.size)
+	}
+	c.evictions++
+	return true
 }

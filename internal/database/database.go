@@ -5,6 +5,7 @@ import (
 	"hash/fnv"
 	"math"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,11 +51,12 @@ type shard struct {
 // Database 数据库结构
 type Database struct {
 	id     int
-	shards [ShardCount]*shard
+	shards [ShardCount]shard
 
 	// LSM 引擎（可选）
 	lsmEngine *persistence.LSMEnergy
 	config    *DatabaseConfig
+	keyHeat   *KeyTopK
 
 	// 内存管理
 	usedMemory     int64  // 当前使用内存（字节），原子操作
@@ -79,10 +81,8 @@ func NewDatabase(id int) *Database {
 		maxMemory:      cfg.MaxMemory,
 		evictionPolicy: cfg.MaxMemoryPolicy,
 	}
-	for i := 0; i < ShardCount; i++ {
-		db.shards[i] = &shard{
-			data: make(map[string]*datastruct.DataValue),
-		}
+	if strings.Contains(db.evictionPolicy, "lru") {
+		db.keyHeat = NewKeyTopK(1024)
 	}
 	return db
 }
@@ -98,10 +98,8 @@ func NewDatabaseWithConfig(id int, dbConfig *DatabaseConfig) (*Database, error) 
 		maxMemory:      globalConfig.MaxMemory,
 		evictionPolicy: globalConfig.MaxMemoryPolicy,
 	}
-	for i := 0; i < ShardCount; i++ {
-		db.shards[i] = &shard{
-			data: make(map[string]*datastruct.DataValue),
-		}
+	if strings.Contains(db.evictionPolicy, "lru") {
+		db.keyHeat = NewKeyTopK(1024)
 	}
 
 	// 如果是 LSM 持久化模式，初始化 LSM 引擎
@@ -169,13 +167,13 @@ func getColdStartStrategyFromConfig() string {
 // getShardIndex 获取分段索引
 func getShardIndex(key string) int {
 	h := fnv.New32a()
-	h.Write([]byte(key))
+	h.Write(stringToBytesRO(key))
 	return int(h.Sum32()) % ShardCount
 }
 
 // getShard 获取 key 对应的 shard
 func (db *Database) getShard(key string) *shard {
-	return db.shards[getShardIndex(key)]
+	return &db.shards[getShardIndex(key)]
 }
 
 // loadAllFromLSM 从 LSM 全量加载所有数据到内存
@@ -215,6 +213,9 @@ func (db *Database) loadAllFromLSM() error {
 		// 分段锁
 		shard := db.getShard(key)
 		shard.lock.Lock()
+		if shard.data == nil {
+			shard.data = make(map[string]*datastruct.DataValue)
+		}
 		shard.data[key] = dataValue
 		shard.lock.Unlock()
 
@@ -260,7 +261,7 @@ func (db *Database) evictOneKey() bool {
 	maxAttempts := 1000
 	for i := 0; i < maxAttempts; i++ {
 		shardIdx := rand.Intn(ShardCount)
-		shard := db.shards[shardIdx]
+		shard := &db.shards[shardIdx]
 
 		shard.lock.RLock()
 		// 如果 shard 为空，尝试下一个
@@ -331,17 +332,20 @@ func (db *Database) Get(key string) (*datastruct.DataValue, bool) {
 	value, exists := shard.data[key]
 	shard.lock.RUnlock()
 
-	if exists {
+	if exists && value != nil {
 		// 检查过期
 		if value.IsExpired() {
 			return nil, false
+		}
+		if db.keyHeat != nil {
+			db.keyHeat.Add(key)
 		}
 		return value, true
 	}
 
 	// 内存中没有，尝试从 LSM 读取（懒加载）
 	if db.lsmEngine != nil {
-		valBytes, found := db.lsmEngine.Get([]byte(key))
+		valBytes, found := db.lsmEngine.Get(stringToBytesRO(key))
 		if found {
 			// 反序列化
 			dataValue, err := datastruct.DeserializeDataValue(valBytes)
@@ -354,33 +358,46 @@ func (db *Database) Get(key string) (*datastruct.DataValue, bool) {
 			// 检查过期
 			if dataValue.IsExpired() {
 				// 异步删除过期数据
+				k := strings.Clone(key)
 				go func(k string) {
-					if err := db.lsmEngine.Delete([]byte(k)); err != nil {
+					if err := db.lsmEngine.Delete(stringToBytesRO(k)); err != nil {
 						logger.Warn("Failed to delete expired key %s from LSM: %v", k, err)
 					}
-				}(key)
+				}(k)
 				return nil, false
 			}
+
+			stableKey := strings.Clone(key)
 
 			// 加载到内存（热点数据）
 			shard.lock.Lock()
 			// 双重检查
-			if existingValue, ok := shard.data[key]; ok {
+			if existingValue, ok := shard.data[stableKey]; ok {
 				shard.lock.Unlock()
 				if existingValue.IsExpired() {
 					return nil, false
 				}
+				if db.keyHeat != nil {
+					db.keyHeat.Add(stableKey)
+				}
 				return existingValue, true
 			}
 
-			shard.data[key] = dataValue
+			shard.data[stableKey] = dataValue
 			shard.lock.Unlock()
 
+			if db.keyHeat != nil {
+				db.keyHeat.Add(stableKey)
+			}
 			return dataValue, true
 		}
 	}
 
 	return nil, false
+}
+
+func (db *Database) GetBytes(key []byte) (*datastruct.DataValue, bool) {
+	return db.Get(bytesToString(key))
 }
 
 // Set 设置键值
@@ -390,9 +407,68 @@ func (db *Database) Set(key string, value *datastruct.DataValue) error {
 		return fmt.Errorf("OOM command not allowed when used memory (%d) > 'maxmemory' (%d)", db.usedMemory, db.maxMemory)
 	}
 
+	newKey := false
+	if value != nil {
+		switch v := value.Value.(type) {
+		case *datastruct.String:
+			if v != nil {
+				v.Data = strings.Clone(v.Data)
+			}
+		case *datastruct.List:
+			if v != nil && len(v.Data) > 0 {
+				dst := make([]string, len(v.Data))
+				for i := range v.Data {
+					dst[i] = strings.Clone(v.Data[i])
+				}
+				v.Data = dst
+			}
+		case *datastruct.Hash:
+			if v != nil && len(v.Data) > 0 {
+				dst := make(map[string]string, len(v.Data))
+				for k, vv := range v.Data {
+					dst[strings.Clone(k)] = strings.Clone(vv)
+				}
+				v.Data = dst
+			}
+		case *datastruct.Set:
+			if v != nil && len(v.Data) > 0 {
+				dst := make(map[string]struct{}, len(v.Data))
+				for m := range v.Data {
+					dst[strings.Clone(m)] = struct{}{}
+				}
+				v.Data = dst
+			}
+		case *datastruct.ZSet:
+			if v != nil && len(v.Data) > 0 {
+				dst := make(map[string]float64, len(v.Data))
+				for m, score := range v.Data {
+					dst[strings.Clone(m)] = score
+				}
+				v.Data = dst
+				if len(v.Scores) > 0 {
+					sdst := make([]datastruct.ZSetMember, len(v.Scores))
+					for i := range v.Scores {
+						sdst[i] = datastruct.ZSetMember{Member: strings.Clone(v.Scores[i].Member), Score: v.Scores[i].Score}
+					}
+					v.Scores = sdst
+				}
+			}
+		}
+	}
+
 	shard := db.getShard(key)
 	shard.lock.Lock()
-	shard.data[key] = value
+	if shard.data == nil {
+		shard.data = make(map[string]*datastruct.DataValue)
+	}
+	old, exists := shard.data[key]
+	if exists {
+		shard.data[key] = value
+	} else {
+		key = strings.Clone(key)
+		newKey = true
+		shard.data[key] = value
+	}
 	shard.lock.Unlock()
 
 	// 如果启用了 LSM，同时写入 LSM 引擎
@@ -400,7 +476,7 @@ func (db *Database) Set(key string, value *datastruct.DataValue) error {
 		// 将数据序列化后写入 LSM
 		dataBytes, err := value.Serialize()
 		if err == nil {
-			err = db.lsmEngine.Put([]byte(key), dataBytes)
+			err = db.lsmEngine.Put(stringToBytesRO(key), dataBytes)
 			if err != nil {
 				logger.Error("Failed to write to LSM: %v", err)
 			}
@@ -410,9 +486,24 @@ func (db *Database) Set(key string, value *datastruct.DataValue) error {
 	}
 
 	// 更新内存统计
-	memDelta := int64(len(key)) + value.ApproximateSize()
+	var oldSize int64
+	if old != nil {
+		oldSize = old.ApproximateSize()
+	}
+	var newSize int64
+	if value != nil {
+		newSize = value.ApproximateSize()
+	}
+	memDelta := newSize - oldSize
+	if newKey {
+		memDelta += int64(len(key))
+	}
 	db.updateMemoryUsage(memDelta)
 	return nil
+}
+
+func (db *Database) SetBytes(key []byte, value *datastruct.DataValue) error {
+	return db.Set(bytesToString(key), value)
 }
 
 // Delete 删除键
@@ -434,7 +525,7 @@ func (db *Database) Delete(key string) bool {
 	// 如果启用了 LSM，始终尝试从 LSM 删除
 	// 无论内存中是否存在，LSM 中可能存在（例如懒加载或数据不一致）
 	if db.lsmEngine != nil {
-		err := db.lsmEngine.Delete([]byte(key))
+		err := db.lsmEngine.Delete(stringToBytesRO(key))
 		if err != nil {
 			logger.Error("Failed to delete from LSM: %v", err)
 		}
@@ -443,14 +534,18 @@ func (db *Database) Delete(key string) bool {
 	return exists
 }
 
+func (db *Database) DeleteBytes(key []byte) bool {
+	return db.Delete(bytesToString(key))
+}
+
 // Exists 检查键是否存在
 func (db *Database) Exists(key string) bool {
 	shard := db.getShard(key)
 	shard.lock.RLock()
 	defer shard.lock.RUnlock()
 
-	_, exists := shard.data[key]
-	return exists && !shard.data[key].IsExpired()
+	value, exists := shard.data[key]
+	return exists && value != nil && !value.IsExpired()
 }
 
 // Expire 设置过期时间
@@ -474,7 +569,7 @@ func (db *Database) Keys() []string {
 	keys := make([]string, 0)
 
 	for i := 0; i < ShardCount; i++ {
-		shard := db.shards[i]
+		shard := &db.shards[i]
 		shard.lock.RLock()
 		for key, value := range shard.data {
 			if value != nil && !value.IsExpired() {
@@ -490,10 +585,10 @@ func (db *Database) Keys() []string {
 func (db *Database) Size() int {
 	count := 0
 	for i := 0; i < ShardCount; i++ {
-		shard := db.shards[i]
+		shard := &db.shards[i]
 		shard.lock.RLock()
 		for _, value := range shard.data {
-			if !value.IsExpired() {
+			if value != nil && !value.IsExpired() {
 				count++
 			}
 		}
@@ -505,9 +600,9 @@ func (db *Database) Size() int {
 // Clear 清空数据库
 func (db *Database) Clear() {
 	for i := 0; i < ShardCount; i++ {
-		shard := db.shards[i]
+		shard := &db.shards[i]
 		shard.lock.Lock()
-		shard.data = make(map[string]*datastruct.DataValue)
+		shard.data = nil
 		shard.lock.Unlock()
 	}
 
@@ -523,7 +618,7 @@ func (db *Database) Close() error {
 	// 这里不需要对所有 shards 加锁，因为 Close 意味着系统正在关闭
 	// 但为了安全起见，我们还是可以加锁，或者直接关闭 LSM
 	for i := 0; i < ShardCount; i++ {
-		shard := db.shards[i]
+		shard := &db.shards[i]
 		shard.lock.Lock()
 		shard.lock.Unlock()
 	}
@@ -540,7 +635,7 @@ func (db *Database) GetStats() map[string]interface{} {
 
 	keyCount := 0
 	for i := 0; i < ShardCount; i++ {
-		shard := db.shards[i]
+		shard := &db.shards[i]
 		shard.lock.RLock()
 		keyCount += len(shard.data)
 		shard.lock.RUnlock()

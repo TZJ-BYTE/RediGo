@@ -462,13 +462,13 @@ grep -E "(Recover|LoadAllKeys)" logs/redigo.log
   - 通过 `Options.ValueThreshold` 控制是否写入 vLog（默认 64 字节）。
   - 已包含 vLog GC（基于 key 校验与重写）。
 
-#### 3. 存算分离架构 (Cloud Native Tiering)
+#### 3. 存算分离架构 (Cloud Native Tiering)（已实现基础版）
 
 - **痛点**: 本地磁盘容量有限，扩容复杂且昂贵。
-- **创新**: **基于 S3/MinIO 的冷数据卸载**。
-  - **Level 0-1 (热层)**: 驻留本地 NVMe SSD，保证极速读写。
-  - **Level 2+ (冷层)**: 自动异步上传到对象存储 (S3)。
-  - **按需加载**: 本地仅保留冷数据的元数据和 Bloom Filter，读取时按需从 S3 拉取 Block。
+- **当前实现**: **SSTable 文件级别卸载**（上传/下载整文件）。
+  - **默认策略**: `Level 2+` 可卸载（由 `Options.OffloadMinLevel` 控制）。
+  - **按需回源**: 本地缺失 SSTable 时，读取路径自动从对象存储下载回本地再打开。
+  - **后端**: `fs`（本地目录对象存储）默认可用；`minio` 支持需要 `-tags=minio` 编译。
   - **收益**: 实现“无限容量”的 Redis，成本极低，完美适配 Serverless 架构。
 
 ***

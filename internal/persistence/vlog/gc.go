@@ -5,17 +5,36 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 )
 
 // ValueLogGC 垃圾回收器
 type ValueLogGC struct {
 	dirPath      string
-	gcThreshold  float64 // 垃圾回收阈值 (例如 0.5 表示 50% 空间无效时回收)
+	gcThreshold  float64                                          // 垃圾回收阈值 (例如 0.5 表示 50% 空间无效时回收)
 	checkKeyFunc func(key []byte, vp *ValuePointer) (bool, error) // 回调函数：检查 Key 指向的 VP 是否依然有效
-	rewriteFunc  func(key, value []byte) error // 回调函数：重写有效数据
+	rewriteFunc  func(key, value []byte) error                    // 回调函数：重写有效数据
+
+	mu       sync.Mutex
+	progress gcProgress
 }
+
+type gcProgress struct {
+	fid       uint32
+	phase     uint8
+	offset    int64
+	validSize int64
+	fileSize  int64
+}
+
+const (
+	gcPhaseScan uint8 = iota
+	gcPhaseRewrite
+)
 
 // NewValueLogGC 创建 GC
 func NewValueLogGC(dirPath string, threshold float64, checkFunc func([]byte, *ValuePointer) (bool, error), rewriteFunc func([]byte, []byte) error) *ValueLogGC {
@@ -32,11 +51,21 @@ func NewValueLogGC(dirPath string, threshold float64, checkFunc func([]byte, *Va
 // 1. 遍历所有 vLog 文件（除了当前活跃的）
 // 2. 对每个文件，随机采样或全量扫描，计算有效数据比例
 // 3. 如果有效比例低于阈值，则重写该文件：
-//    - 读取有效数据
-//    - 写入当前活跃 vLog
-//    - 更新 LSM Tree 中的索引
-//    - 删除旧文件
+//   - 读取有效数据
+//   - 写入当前活跃 vLog
+//   - 更新 LSM Tree 中的索引
+//   - 删除旧文件
 func (gc *ValueLogGC) RunGC() error {
+	return gc.RunGCWithBudget(0, 0, 0)
+}
+
+func (gc *ValueLogGC) RunGCWithBudget(scanMaxBytes int64, rewriteMaxBytes int64, maxDuration time.Duration) error {
+	start := time.Now()
+
+	gc.mu.Lock()
+	p := gc.progress
+	gc.mu.Unlock()
+
 	files, err := gc.listFiles()
 	if err != nil {
 		return err
@@ -46,16 +75,40 @@ func (gc *ValueLogGC) RunGC() error {
 		return nil // 只有一个文件（或者是空的），无需 GC
 	}
 
-	// 简单策略：总是尝试清理最旧的文件（除了最新的）
-	// 排除最新的活跃文件（ID最大）
-	targetFile := files[0] // ID 最小的文件
-	
-	// 如果是活跃文件，跳过
-	if targetFile == files[len(files)-1] {
+	active := files[len(files)-1]
+
+	var fid uint32
+	if p.fid != 0 {
+		fid = p.fid
+	} else {
+		fid = files[0]
+		if fid == active {
+			return nil
+		}
+		p = gcProgress{fid: fid, phase: gcPhaseScan}
+	}
+
+	if fid == active {
+		gc.mu.Lock()
+		gc.progress = gcProgress{}
+		gc.mu.Unlock()
 		return nil
 	}
 
-	return gc.compactFile(targetFile)
+	switch p.phase {
+	case gcPhaseScan:
+		err = gc.scanFileWithBudget(&p, scanMaxBytes, maxDuration, start)
+	case gcPhaseRewrite:
+		err = gc.rewriteFileWithBudget(&p, rewriteMaxBytes, maxDuration, start)
+	default:
+		p = gcProgress{fid: fid, phase: gcPhaseScan}
+		err = gc.scanFileWithBudget(&p, scanMaxBytes, maxDuration, start)
+	}
+
+	gc.mu.Lock()
+	gc.progress = p
+	gc.mu.Unlock()
+	return err
 }
 
 // listFiles 获取所有 vLog 文件 ID，按从小到大排序
@@ -79,32 +132,35 @@ func (gc *ValueLogGC) listFiles() ([]uint32, error) {
 	return fids, nil
 }
 
-// compactFile 压缩单个文件
-func (gc *ValueLogGC) compactFile(fid uint32) error {
-	filename := fmt.Sprintf("%s/%06d.vlog", gc.dirPath, fid)
+func (gc *ValueLogGC) scanFileWithBudget(p *gcProgress, maxBytes int64, maxDuration time.Duration, start time.Time) error {
+	filename := filepath.Join(gc.dirPath, fmt.Sprintf("%06d.vlog", p.fid))
 	file, err := os.Open(filename)
 	if err != nil {
-		return err
+		*p = gcProgress{}
+		return nil
 	}
 	defer file.Close()
 
 	info, err := file.Stat()
 	if err != nil {
-		return err
+		*p = gcProgress{}
+		return nil
 	}
 	fileSize := info.Size()
-	
-	validSize := int64(0)
-	var validEntries []struct {
-		key   []byte
-		value []byte
-	}
+	p.fileSize = fileSize
 
-	// 遍历文件
-	offset := int64(0)
+	offset := p.offset
 	header := make([]byte, 8)
 	for offset < fileSize {
-		// 读取头部
+		if maxDuration > 0 && time.Since(start) >= maxDuration {
+			p.offset = offset
+			return nil
+		}
+		if maxBytes > 0 && offset-p.offset >= maxBytes {
+			p.offset = offset
+			return nil
+		}
+
 		_, err := file.ReadAt(header, offset)
 		if err != nil {
 			if err == io.EOF {
@@ -112,88 +168,138 @@ func (gc *ValueLogGC) compactFile(fid uint32) error {
 			}
 			return err
 		}
-		
+
 		keyLen := binary.BigEndian.Uint32(header[0:4])
 		valLen := binary.BigEndian.Uint32(header[4:8])
 		entrySize := 8 + int64(keyLen) + int64(valLen)
-		
-		// 读取 Key
+
 		key := make([]byte, keyLen)
 		_, err = file.ReadAt(key, offset+8)
 		if err != nil {
 			return err
 		}
-		
-		// 检查 Key 是否有效
-		// 构造当前 Entry 的 ValuePointer
+
 		vp := &ValuePointer{
-			Fid:    fid,
+			Fid:    p.fid,
 			Len:    uint32(entrySize),
 			Offset: offset,
 		}
-		
 		isValid, err := gc.checkKeyFunc(key, vp)
 		if err != nil {
 			return err
 		}
-		
 		if isValid {
-			validSize += entrySize
-			// 读取 Value
+			p.validSize += entrySize
+		}
+
+		offset += entrySize
+	}
+
+	p.offset = offset
+	if p.offset < fileSize {
+		return nil
+	}
+
+	if fileSize == 0 {
+		*p = gcProgress{}
+		return nil
+	}
+
+	ratio := float64(p.validSize) / float64(fileSize)
+	if ratio < gc.gcThreshold {
+		if gc.rewriteFunc == nil {
+			*p = gcProgress{}
+			return fmt.Errorf("GC found garbage in file %d, but rewriteFunc is not set", p.fid)
+		}
+		p.phase = gcPhaseRewrite
+		p.offset = 0
+		return nil
+	}
+
+	*p = gcProgress{}
+	return nil
+}
+
+func (gc *ValueLogGC) rewriteFileWithBudget(p *gcProgress, maxBytes int64, maxDuration time.Duration, start time.Time) error {
+	filename := filepath.Join(gc.dirPath, fmt.Sprintf("%06d.vlog", p.fid))
+	file, err := os.Open(filename)
+	if err != nil {
+		*p = gcProgress{}
+		return nil
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		*p = gcProgress{}
+		return nil
+	}
+	fileSize := info.Size()
+
+	offset := p.offset
+	header := make([]byte, 8)
+	for offset < fileSize {
+		if maxDuration > 0 && time.Since(start) >= maxDuration {
+			p.offset = offset
+			return nil
+		}
+		if maxBytes > 0 && offset-p.offset >= maxBytes {
+			p.offset = offset
+			return nil
+		}
+
+		_, err := file.ReadAt(header, offset)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+
+		keyLen := binary.BigEndian.Uint32(header[0:4])
+		valLen := binary.BigEndian.Uint32(header[4:8])
+		entrySize := 8 + int64(keyLen) + int64(valLen)
+
+		key := make([]byte, keyLen)
+		_, err = file.ReadAt(key, offset+8)
+		if err != nil {
+			return err
+		}
+
+		vp := &ValuePointer{
+			Fid:    p.fid,
+			Len:    uint32(entrySize),
+			Offset: offset,
+		}
+		isValid, err := gc.checkKeyFunc(key, vp)
+		if err != nil {
+			return err
+		}
+
+		if isValid {
 			value := make([]byte, valLen)
 			_, err = file.ReadAt(value, offset+8+int64(keyLen))
 			if err != nil {
 				return err
 			}
-			validEntries = append(validEntries, struct {
-				key   []byte
-				value []byte
-			}{key, value})
-		}
-		
-		offset += entrySize
-	}
-	
-	// 计算有效率
-	ratio := float64(validSize) / float64(fileSize)
-	// fmt.Printf("GC Check File %d: valid ratio %.2f (%d/%d)\n", fid, ratio, validSize, fileSize)
-	
-	if ratio < gc.gcThreshold {
-		// 需要回收
-		// 注意：这里的回收逻辑需要与 LSM Engine 交互
-		// 我们通过回调函数 checkKeyFunc 返回 true 来确认 key 有效
-		// 但真正的重写逻辑需要调用 Writer.Write 并更新 LSM Tree
-		// 这部分逻辑比较复杂，通常需要 LSM Engine 提供一个 "Rewrite" 接口
-		// 这里我们暂时只打印日志，表示发现了可回收文件
-		// fmt.Printf("GC: File %d should be compacted (ratio %.2f < %.2f)\n", fid, ratio, gc.gcThreshold)
-		
-		// 实际执行重写需要:
-	// 1. 将 validEntries 写入 active vLog
-	// 2. 更新 LSM Tree 中的索引指向新的位置
-	// 3. 删除旧文件
-	
-	// 为了解耦，我们定义一个回调函数来执行重写操作
-	if gc.rewriteFunc != nil {
-		for _, entry := range validEntries {
-			// 调用 rewriteFunc 将数据写入新的 vLog 并更新 LSM Tree
-			err := gc.rewriteFunc(entry.key, entry.value)
-			if err != nil {
+			if err := gc.rewriteFunc(key, value); err != nil {
 				return fmt.Errorf("failed to rewrite entry during GC: %v", err)
 			}
 		}
-		
-		// 重写完成后，删除旧文件
-		// 注意：这只是一个简单的删除，实际生产中可能需要更安全的删除策略（如重命名后延迟删除）
-		file.Close() // 确保关闭
-		if err := os.Remove(filename); err != nil {
-			return fmt.Errorf("failed to remove compacted file %s: %v", filename, err)
-		}
-		
+
+		offset += entrySize
+	}
+
+	p.offset = offset
+	if p.offset < fileSize {
 		return nil
 	}
-	
-	return fmt.Errorf("GC found garbage in file %d, but rewriteFunc is not set", fid)
-}
-	
+
+	file.Close()
+	if err := os.Remove(filename); err != nil {
+		return fmt.Errorf("failed to remove compacted file %s: %v", filename, err)
+	}
+
+	*p = gcProgress{}
 	return nil
 }

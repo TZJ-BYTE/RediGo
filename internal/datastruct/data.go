@@ -12,6 +12,7 @@ import (
 func init() {
 	// 注册指针类型，确保 gob 解码时还原为指针
 	gob.Register(&String{})
+	gob.Register(&BytesString{})
 	gob.Register(&List{})
 	gob.Register(&Hash{})
 	gob.Register(&Set{})
@@ -36,6 +37,8 @@ func (dv *DataValue) ApproximateSize() int64 {
 
 	switch v := dv.Value.(type) {
 	case *String:
+		size += int64(len(v.Data))
+	case *BytesString:
 		size += int64(len(v.Data))
 	case *List:
 		for _, s := range v.Data {
@@ -162,6 +165,10 @@ func DeserializeDataValue(data []byte) (*DataValue, error) {
 // String 字符串类型
 type String struct {
 	Data string
+}
+
+type BytesString struct {
+	Data []byte
 }
 
 // List 列表类型

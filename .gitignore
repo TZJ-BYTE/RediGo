@@ -59,3 +59,6 @@ coverage.html
 # Debugging
 .debug
 *.dbg
+
+# Bench artifacts
+bench-results/

@@ -7,10 +7,10 @@ import (
 
 // TableCache LRU Table Cache (File Descriptor Cache)
 type TableCache struct {
-	mu        sync.RWMutex
-	cache     map[uint64]*list.Element // fileNum -> list element
-	lruList   *list.List               // LRU 链表，头部是最最近使用的
-	capacity  int                      // 最大缓存数量（MaxOpenFiles）
+	mu       sync.RWMutex
+	cache    map[uint64]*list.Element // fileNum -> list element
+	lruList  *list.List               // LRU 链表，头部是最最近使用的
+	capacity int                      // 最大缓存数量（MaxOpenFiles）
 }
 
 type tableCacheItem struct {
@@ -46,7 +46,7 @@ func (c *TableCache) GetOrOpen(fileNum uint64, openFunc func() (*SSTableReader, 
 	// 在高并发场景下，可能需要优化（例如使用 singleflight）。
 	// 但考虑到 openFunc 主要是文件打开操作，且我们希望严格控制文件描述符数量，
 	// 持有锁是合理的，可以避免并发打开同一个文件或超出限制。
-	
+
 	reader, err := openFunc()
 	if err != nil {
 		return nil, err
@@ -111,6 +111,8 @@ func (c *TableCache) Evict(fileNum uint64) {
 	defer c.mu.Unlock()
 
 	if elem, ok := c.cache[fileNum]; ok {
+		item := elem.Value.(*tableCacheItem)
+		_ = item.reader.Close()
 		c.removeElement(elem)
 	}
 }
